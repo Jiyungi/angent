@@ -15,7 +15,6 @@ import { useCallback, useEffect, useState } from "react";
 import LoopStatusDisplay from "../components/react-shell/LoopStatusDisplay";
 import QualifiedCompanyCard from "../components/react-shell/QualifiedCompanyCard";
 import DraftedEmailPreview from "../components/react-shell/DraftedEmailPreview";
-import ThesisChat from "../components/openui/ThesisChat";
 
 // --- Representative demo data (shape matches the ClickHouse `companies` /
 // `emails` / `loop_state` rows the Python core produces). ---------------------
@@ -24,8 +23,6 @@ const DEMO_THESIS =
   "Early-stage developer-tools and AI-infrastructure startups: open-source " +
   "frameworks, LLM agent tooling, data/ML platforms, and API-first products " +
   "that help engineers ship faster.";
-
-type Tab = "dashboard" | "thesis";
 
 // --- ClickHouse signals (JSON string) -> a few readable chips ---------------
 function signalsToChips(raw: unknown): string[] {
@@ -93,7 +90,6 @@ interface DashboardData {
 }
 
 export default function Home() {
-  const [tab, setTab] = useState<Tab>("dashboard");
   const [data, setData] = useState<DashboardData | null>(null);
   const [live, setLive] = useState(false);
   const [running, setRunning] = useState(false);
@@ -216,31 +212,12 @@ export default function Home() {
             <span className={`h-1.5 w-1.5 rounded-full ${live ? "bg-emerald-500" : "bg-slate-400"}`} />
             {live ? "live · ClickHouse" : "awaiting run"}
           </span>
-          <div className="flex gap-1 rounded-xl bg-slate-100 p-1 text-sm">
-            <button
-              onClick={() => setTab("dashboard")}
-              className={`rounded-lg px-3 py-1.5 font-medium transition ${
-                tab === "dashboard" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-800"
-              }`}
-            >
-              Dashboard
-            </button>
-            <button
-              onClick={() => setTab("thesis")}
-              className={`rounded-lg px-3 py-1.5 font-medium transition ${
-                tab === "thesis" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-800"
-              }`}
-            >
-              Thesis Chat
-            </button>
-          </div>
         </nav>
       </header>
 
       {/* Body */}
       <main className="min-h-0 flex-1 overflow-auto">
-        {tab === "dashboard" ? (
-          <div className="mx-auto flex max-w-6xl flex-col gap-6 p-6">
+        <div className="mx-auto flex max-w-6xl flex-col gap-6 p-6">
             {/* Thesis + Run */}
             <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
               <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-stretch">
@@ -338,11 +315,6 @@ export default function Home() {
               Powered by ClickHouse · TrueFoundry · Langfuse · Airbyte · x402
             </div>
           </div>
-        ) : (
-          <div className="h-full w-full">
-            <ThesisChat initialThesis={thesis} />
-          </div>
-        )}
       </main>
     </div>
   );

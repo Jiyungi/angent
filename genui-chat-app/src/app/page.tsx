@@ -10,7 +10,7 @@
 //     (Requirement 14), reusing the library.prompt() -> /api/chat -> <Renderer/>
 //     pipeline.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 
 import LoopStatusDisplay from "../components/react-shell/LoopStatusDisplay";
 import QualifiedCompanyCard from "../components/react-shell/QualifiedCompanyCard";
@@ -107,10 +107,6 @@ export default function Home() {
       /* keep demo fallback */
     }
   }, []);
-
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
 
   const runAgent = useCallback(async () => {
     setRunning(true);

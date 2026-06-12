@@ -20,10 +20,27 @@ Scanner into scored :class:`~angent.models.Qualified` rows the Writer can act on
    **never discarded** even when persistence ultimately fails — the returned
    :class:`Qualified` always carries them (Requirements 5.5, 12.6, 22).
 
-This module implements the scoring + explanation + persistence half of the
-Qualifier. The per-candidate Pioneer fallback and the threshold-based forwarding
-of qualified candidates to the Writer are layered on separately; ``threshold`` is
-accepted here for interface stability but every scored candidate is returned.
+This module implements the full Qualifier:
+
+* **Scoring + explanation + persistence** (Requirement 5.1–5.5): every candidate
+  is scored, explained, and upserted into ``companies``.
+* **Per-candidate Pioneer fallback** (Requirements 5.6, 5.7, 7.3, 18.5): the
+  active :class:`~angent.scoring.scorer.Scorer` (typically the
+  :class:`~angent.scoring.pioneer.PioneerScorer`) is tried first within its 10s
+  per-candidate timeout; if it raises (timeout, transport error, or any failure)
+  the Qualifier falls back to a :class:`~angent.scoring.scorer.HeuristicScorer`
+  **for that candidate only**, records that the fallback occurred, and continues
+  the remaining candidates without aborting the Tick.
+* **Threshold-based forwarding** (Requirements 5.8, 5.9): candidates whose
+  ``fit_score`` meets or exceeds the configured integer qualification threshold
+  (``[0,100]``) are forwarded to the Writer; those below are withheld. *Every*
+  candidate is still scored and persisted regardless of the threshold — only the
+  forwarding set is filtered.
+
+:meth:`Qualifier.qualify` returns a :class:`QualifyResult` so the orchestrator can
+distinguish ``all`` (every scored candidate) from ``qualified``/``forwarded``
+(those at or above the threshold), and inspect which candidates fell back to the
+heuristic via ``fallbacks``.
 """
 
 from __future__ import annotations
@@ -32,11 +49,12 @@ import json
 import logging
 import os
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from angent.models import Candidate, Qualified
-from angent.scoring.scorer import Scorer
+from angent.scoring.scorer import HeuristicScorer, Scorer
 
 logger = logging.getLogger("angent.agents.qualifier")
 
@@ -90,6 +108,71 @@ def _clamp_score(value: Any) -> int:
     return max(0, min(100, numeric))
 
 
+def _validate_threshold(threshold: Any) -> int:
+    """Validate the qualification threshold is an integer in the inclusive [0,100].
+
+    The threshold gates which candidates are forwarded to the Writer
+    (Requirement 5.8). It must be a genuine integer in ``[0,100]``; a bool, a
+    non-integral float, or an out-of-range value is rejected with ``ValueError``
+    so a misconfigured threshold fails fast rather than silently forwarding the
+    wrong set.
+    """
+    if isinstance(threshold, bool):
+        raise ValueError("qualification threshold must be an int, not a bool")
+    if isinstance(threshold, float):
+        if not threshold.is_integer():
+            raise ValueError(
+                f"qualification threshold must be an integer, got {threshold!r}"
+            )
+        threshold = int(threshold)
+    if not isinstance(threshold, int):
+        raise ValueError(
+            f"qualification threshold must be an int in [0,100], got {type(threshold).__name__}"
+        )
+    if not 0 <= threshold <= 100:
+        raise ValueError(
+            f"qualification threshold must be in [0,100], got {threshold}"
+        )
+    return threshold
+
+
+@dataclass
+class QualifyResult:
+    """The outcome of a Qualifier pass over a batch of candidates.
+
+    Lets the orchestrator distinguish every scored candidate from the subset
+    forwarded to the Writer, and inspect per-candidate Pioneer fallbacks.
+
+    Attributes:
+        all: Every candidate that was scored, explained, and persisted, in input
+            order — regardless of whether it met the threshold (Requirement 5.4
+            keeps every score; below-threshold rows are still persisted, just not
+            forwarded).
+        qualified: The subset of ``all`` whose ``fit_score`` is >= ``threshold``;
+            these are the candidates forwarded to the Writer (Requirements 5.8,
+            5.9). ``forwarded`` is a readable alias.
+        fallbacks: ``source_unique_id`` values of candidates whose active-scorer
+            call failed and fell back to the heuristic for that candidate only
+            (Requirements 5.7, 7.3, 18.5).
+        threshold: The validated integer threshold applied to this pass.
+    """
+
+    all: list[Qualified] = field(default_factory=list)
+    qualified: list[Qualified] = field(default_factory=list)
+    fallbacks: list[str] = field(default_factory=list)
+    threshold: int = 0
+
+    @property
+    def forwarded(self) -> list[Qualified]:
+        """Readable alias for :attr:`qualified` — the rows passed to the Writer."""
+        return self.qualified
+
+    @property
+    def fallback_count(self) -> int:
+        """How many candidates fell back to the heuristic scorer this pass."""
+        return len(self.fallbacks)
+
+
 class Qualifier:
     """Scores candidates, explains the fit via TrueFoundry, and persists results.
 
@@ -106,6 +189,10 @@ class Qualifier:
         max_persist_attempts: Bounded retry count for the ``companies`` upsert.
         openai_client: Optional pre-built OpenAI-compatible client (eases testing
             and lets callers inject a configured gateway client).
+        fallback_scorer: The scorer used for a single candidate when the active
+            scorer raises (Pioneer timeout/error). Defaults to a fresh
+            :class:`~angent.scoring.scorer.HeuristicScorer`, which is always
+            available and never performs I/O (Requirements 5.7, 7.3).
         now: Injectable clock for deterministic ``created_at``/``updated_at``.
     """
 
@@ -118,6 +205,7 @@ class Qualifier:
         explanation_timeout: float = DEFAULT_EXPLANATION_TIMEOUT,
         max_persist_attempts: int = DEFAULT_MAX_PERSIST_ATTEMPTS,
         openai_client: Optional[Any] = None,
+        fallback_scorer: Optional[Scorer] = None,
         now: Optional[Callable[[], datetime]] = None,
     ) -> None:
         if config is None:
@@ -135,6 +223,8 @@ class Qualifier:
         )
         self._explanation_timeout = explanation_timeout
         self._max_persist_attempts = max(1, int(max_persist_attempts))
+        # Always-available per-candidate fallback (Requirements 5.7, 7.3).
+        self._fallback_scorer: Scorer = fallback_scorer or HeuristicScorer()
         self._now: Callable[[], datetime] = now or (lambda: datetime.now(timezone.utc))
         # Lazily constructed OpenAI client pointed at the TrueFoundry gateway.
         self._openai_client = openai_client
@@ -147,26 +237,110 @@ class Qualifier:
         thesis: str,
         scorer: Scorer,
         threshold: int = 0,
-    ) -> list[Qualified]:
-        """Score, explain, and persist each candidate; return ``Qualified`` rows.
+    ) -> QualifyResult:
+        """Score, explain, persist each candidate; forward those at/above threshold.
 
-        Every candidate is scored via ``scorer`` (clamped to ``[0,100]``), given a
-        thesis-referencing explanation via TrueFoundry (or the placeholder on
-        timeout/error), persisted to ``companies`` with bounded retry, and
-        returned as a :class:`~angent.models.Qualified`. The computed score and
-        explanation are retained on the returned object even if persistence fails.
+        For each candidate this:
 
-        ``threshold`` is accepted for interface stability; threshold-based
-        forwarding to the Writer is handled downstream, so all scored candidates
-        are returned here.
+        1. Obtains a fit score from the active ``scorer`` (clamped to ``[0,100]``).
+           If the active scorer raises — a Pioneer timeout/error or any failure —
+           it falls back to the heuristic scorer **for that candidate only**,
+           records the fallback, and continues the remaining candidates without
+           aborting the Tick (Requirements 5.6, 5.7, 7.3, 18.5).
+        2. Generates a thesis-referencing explanation via TrueFoundry (or the
+           placeholder on timeout/error) and persists score + explanation to
+           ``companies`` with bounded retry — **every** candidate is persisted,
+           regardless of the threshold (Requirements 5.2–5.5).
+        3. Collects the candidate into ``all``; if its score meets or exceeds
+           ``threshold`` it is also added to ``qualified`` (forwarded to the
+           Writer), otherwise it is withheld (Requirements 5.8, 5.9).
+
+        Args:
+            candidates: Candidates discovered by the Scanner this Tick.
+            thesis: The investor's thesis the candidates are scored against.
+            scorer: The active scorer (e.g. ``PioneerScorer``). Failures fall back
+                per-candidate to ``self._fallback_scorer``.
+            threshold: Integer qualification threshold in ``[0,100]``; candidates
+                with ``fit_score >= threshold`` are forwarded.
+
+        Returns:
+            A :class:`QualifyResult` with ``all`` (every scored candidate),
+            ``qualified``/``forwarded`` (score >= threshold), and ``fallbacks``.
+
+        Raises:
+            ValueError: if ``threshold`` is not an integer in ``[0,100]``.
         """
-        qualified: list[Qualified] = []
+        threshold = _validate_threshold(threshold)
+        result = QualifyResult(threshold=threshold)
+
         for candidate in candidates or []:
-            score = _clamp_score(scorer.score(candidate, thesis))
+            score, used_fallback = self._score_candidate(candidate, thesis, scorer)
+            if used_fallback:
+                result.fallbacks.append(
+                    getattr(candidate, "source_unique_id", "") or ""
+                )
             explanation = self._explain(candidate, thesis, score)
             self._persist(candidate, score, explanation)
-            qualified.append(self._to_qualified(candidate, score, explanation))
-        return qualified
+
+            qualified = self._to_qualified(candidate, score, explanation)
+            result.all.append(qualified)
+            if score >= threshold:
+                result.qualified.append(qualified)
+            else:
+                logger.info(
+                    "Candidate %s scored %d < threshold %d; withheld from Writer.",
+                    getattr(candidate, "source_unique_id", "?"),
+                    score,
+                    threshold,
+                )
+
+        logger.info(
+            "Qualifier pass: %d scored, %d forwarded (threshold %d), %d fallback(s).",
+            len(result.all),
+            len(result.qualified),
+            threshold,
+            result.fallback_count,
+        )
+        return result
+
+    # -- per-candidate scoring with fallback ---------------------------------
+
+    def _score_candidate(
+        self, candidate: Candidate, thesis: str, scorer: Scorer
+    ) -> tuple[int, bool]:
+        """Score one candidate via the active scorer, falling back on any failure.
+
+        Tries ``scorer.score`` first (the active scorer; for Pioneer this carries
+        its own 10s per-candidate timeout and raises on timeout/error). On *any*
+        exception it falls back to the heuristic scorer for this candidate only,
+        logs the fallback, and the Tick continues (Requirements 5.7, 7.3, 18.5).
+        If the fallback scorer also fails, the candidate is scored 0 so the Tick
+        still proceeds.
+
+        Returns:
+            ``(score, used_fallback)`` where ``score`` is clamped to ``[0,100]``
+            and ``used_fallback`` is True when the heuristic fallback was used.
+        """
+        try:
+            return _clamp_score(scorer.score(candidate, thesis)), False
+        except Exception as exc:  # noqa: BLE001 - any active-scorer failure -> fallback
+            logger.warning(
+                "Active scorer failed for candidate %s: %s; falling back to "
+                "HeuristicScorer for this candidate only.",
+                getattr(candidate, "source_unique_id", "?"),
+                exc,
+            )
+
+        try:
+            return _clamp_score(self._fallback_scorer.score(candidate, thesis)), True
+        except Exception as exc:  # noqa: BLE001 - fallback failed too; keep Tick alive
+            logger.error(
+                "Fallback scorer also failed for candidate %s: %s; scoring 0 so "
+                "the Tick continues.",
+                getattr(candidate, "source_unique_id", "?"),
+                exc,
+            )
+            return 0, True
 
     # -- explanation (TrueFoundry gateway) -----------------------------------
 

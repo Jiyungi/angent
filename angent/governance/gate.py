@@ -32,14 +32,93 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any, Optional
 
 # Reuse the canonical ``emails`` column order so reads/rewrites stay in lock-step
 # with the Writer's inserts and the EMAILS_DDL schema (single source of truth).
 from angent.agents.writer import EMAILS_COLUMNS
+from angent.models import Draft
 
 logger = logging.getLogger("angent.governance.gate")
+
+# A send deferred longer than this many seconds is surfaced to the Investor as
+# still-pending due to the rate limit (Requirement 9.6 / design "Governance Gate").
+DEFERRAL_PENDING_SECONDS = 3600
+
+
+class Decision(str, Enum):
+    """The three send-time verdicts ``authorize_send`` can return.
+
+    Subclasses ``str`` so the verdict serializes/compares as its lowercase
+    string (``"permit"`` / ``"block"`` / ``"defer"``) for logs, audit rows, and
+    JSON surfaced to the Investor — mirroring the ``StopReason`` enum style.
+
+    * ``PERMIT`` — the send may proceed (approved, within budget, within rate).
+    * ``BLOCK``  — the send is rejected for a recorded ``reason`` and must not be
+      retried as-is (unapproved draft or budget exhaustion).
+    * ``DEFER``  — the send is rate-limited; it should be re-attempted in the next
+      rate-limit window rather than blocked outright.
+    """
+
+    PERMIT = "permit"
+    BLOCK = "block"
+    DEFER = "defer"
+
+
+@dataclass(frozen=True)
+class RateWindow:
+    """The current rate-limit window state passed to :meth:`authorize_send`.
+
+    A minimal, pure value object: it carries only what the decision needs to
+    judge the rate limit and how long a deferral has lasted. It performs no I/O —
+    the caller (Sender/orchestrator) computes ``sent_in_window`` from the
+    blackboard and hands it in.
+
+    Attributes:
+        sent_in_window: Number of sends already made inside the current window.
+        limit: The configured maximum sends per window (Requirement 9.5). When a
+            send would push usage to ``>= limit`` the send is deferred.
+        window_start: The tz-aware instant the current rate-limit window began.
+            This is also the moment from which a deferral is measured: when a send
+            is deferred and ``now - window_start`` exceeds
+            :data:`DEFERRAL_PENDING_SECONDS`, the deferral is reported as pending
+            (Requirement 9.6). ``None`` means the window has no recorded start, so
+            no elapsed time can be computed and the deferral is not yet pending.
+    """
+
+    sent_in_window: int
+    limit: int
+    window_start: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class SendDecision:
+    """The verdict returned by :meth:`authorize_send` (a pure decision).
+
+    Attributes:
+        decision: One of :class:`Decision` — ``PERMIT``, ``BLOCK``, or ``DEFER``.
+        reason: Short machine-readable cause, recorded with blocks/deferrals and
+            surfaced to the Investor. Empty for ``PERMIT``; one of
+            ``'unapproved'`` / ``'email-budget'`` (for ``BLOCK``) or
+            ``'rate-limit'`` (for ``DEFER``).
+        pending: ``True`` only for a ``DEFER`` whose deferral has lasted longer
+            than :data:`DEFERRAL_PENDING_SECONDS` (3600s); it signals the send
+            "remains pending due to the rate limit" (Requirement 9.6). Always
+            ``False`` for ``PERMIT`` and ``BLOCK``.
+        message: Human-readable explanation surfaced to the Investor.
+    """
+
+    decision: Decision
+    reason: str = ""
+    pending: bool = False
+    message: str = ""
+
+    @property
+    def permitted(self) -> bool:
+        """``True`` only when the send may proceed (``decision is PERMIT``)."""
+        return self.decision is Decision.PERMIT
 
 
 @dataclass
@@ -180,6 +259,125 @@ class GovernanceGate:
                 "for draft %s; it remains pending re-approval at send time.",
                 draft_id,
             )
+
+    # -- send-time authorization (pure decision, no I/O) --------------------
+
+    def authorize_send(
+        self,
+        draft: Draft,
+        sent_count: int,
+        budget: int,
+        window: RateWindow,
+        *,
+        now: Optional[datetime] = None,
+    ) -> SendDecision:
+        """Decide whether ``draft`` may be sent right now (Reqs 9.4, 9.5, 9.6).
+
+        A **pure**, deterministic decision function: it reads only its arguments
+        (no DB reads, no inserts, no clocks beyond the optionally-injected
+        ``now``) and returns a :class:`SendDecision`. The Sender / Guild
+        orchestrator routes every send through this and acts on the verdict;
+        blocks and deferrals never advance the budget counter.
+
+        Decision order (first match wins):
+
+        1. **Unapproved** — if ``not draft.approved`` -> ``BLOCK('unapproved')``.
+           Nothing goes out without a still-valid human approval (Req 9.1/9.2).
+        2. **Budget** — if ``sent_count + 1 > budget`` -> ``BLOCK('email-budget')``.
+           Sending would push the cumulative sent count past the hard cap, so the
+           send is blocked and the reason recorded (Req 9.4, 3.5).
+        3. **Rate limit** — if ``window.sent_in_window >= window.limit`` ->
+           ``DEFER('rate-limit')`` until the next window (Req 9.5). If the
+           deferral has already lasted longer than 3600s
+           (``now - window.window_start``), the returned decision is marked
+           ``pending`` so the Investor sees the send still pending (Req 9.6).
+        4. Otherwise -> ``PERMIT``.
+
+        Args:
+            draft: The draft under consideration; only ``approved`` (and
+                ``email_id`` for messaging) is inspected.
+            sent_count: Cumulative emails already sent in this run.
+            budget: The hard ``email_budget`` cap.
+            window: The current :class:`RateWindow` (in-window count, limit, and
+                window/deferral start instant).
+            now: Optional injected tz-aware "current time" used only to measure a
+                deferral's age; defaults to the gate's clock. Keeping it a
+                parameter preserves purity/determinism for tests.
+
+        Returns:
+            A :class:`SendDecision` describing PERMIT / BLOCK / DEFER, the reason,
+            and (for long deferrals) the pending indication.
+        """
+        draft_id = getattr(draft, "email_id", "")
+
+        # (1) Human-approval gate: block anything not currently approved.
+        if not draft.approved:
+            return SendDecision(
+                decision=Decision.BLOCK,
+                reason="unapproved",
+                message=(
+                    f"Send blocked: draft {draft_id} is not approved; "
+                    "Investor approval is required before sending."
+                ),
+            )
+
+        # (2) Budget cap: block if this send would exceed the email_budget.
+        if sent_count + 1 > budget:
+            return SendDecision(
+                decision=Decision.BLOCK,
+                reason="email-budget",
+                message=(
+                    f"Send blocked: sending draft {draft_id} would exceed the "
+                    f"email budget ({sent_count} sent, budget {budget})."
+                ),
+            )
+
+        # (3) Rate limit: defer while the current window is saturated.
+        if window.sent_in_window >= window.limit:
+            pending = self._deferral_exceeds_pending(window, now)
+            if pending:
+                message = (
+                    f"Send pending: draft {draft_id} has been deferred more than "
+                    f"{DEFERRAL_PENDING_SECONDS}s due to the rate limit and "
+                    "remains pending."
+                )
+            else:
+                message = (
+                    f"Send deferred: draft {draft_id} is rate-limited "
+                    f"({window.sent_in_window}/{window.limit} sent in window); "
+                    "will retry at the start of the next window."
+                )
+            return SendDecision(
+                decision=Decision.DEFER,
+                reason="rate-limit",
+                pending=pending,
+                message=message,
+            )
+
+        # (4) All gates clear: permit the send.
+        return SendDecision(
+            decision=Decision.PERMIT,
+            message=f"Send permitted for draft {draft_id}.",
+        )
+
+    def _deferral_exceeds_pending(
+        self, window: RateWindow, now: Optional[datetime]
+    ) -> bool:
+        """Return ``True`` when this deferral has lasted longer than 3600s.
+
+        Measures ``now - window.window_start``. With no ``window_start`` there is
+        no elapsed time to measure, so the deferral is not yet pending. Both
+        instants are normalized to tz-aware UTC so naive/aware inputs compare
+        safely. Pure aside from the optionally-injected ``now`` (falls back to the
+        gate's clock).
+        """
+        start = self._as_utc(window.window_start)
+        if start is None:
+            return False
+        current = self._as_utc(now) if now is not None else self._as_utc(self._now())
+        if current is None:
+            return False
+        return (current - start) > timedelta(seconds=DEFERRAL_PENDING_SECONDS)
 
     # -- shared read-latest / rewrite-with-bumped-version helpers -----------
 

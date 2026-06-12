@@ -142,6 +142,7 @@ export default function Home() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [live, setLive] = useState(false);
   const [running, setRunning] = useState(false);
+  const [thesis, setThesis] = useState(DEMO_THESIS);
 
   const loadData = useCallback(async () => {
     try {
@@ -163,7 +164,11 @@ export default function Home() {
   const runAgent = useCallback(async () => {
     setRunning(true);
     try {
-      await fetch("/api/run", { method: "POST" });
+      await fetch("/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thesis }),
+      });
     } catch {
       /* ignore */
     }
@@ -291,8 +296,20 @@ export default function Home() {
         {tab === "dashboard" ? (
           <div className="mx-auto flex max-w-6xl flex-col gap-6 p-6">
             <div className="rounded-xl border border-gray-200 bg-white p-4">
-              <p className="text-xs uppercase tracking-wide text-gray-400">Thesis</p>
-              <p className="mt-1 text-sm text-gray-700">{DEMO_THESIS}</p>
+              <label className="text-xs uppercase tracking-wide text-gray-400">
+                Investment thesis — edit, then click Run Agent
+              </label>
+              <textarea
+                value={thesis}
+                onChange={(e) => setThesis(e.target.value)}
+                rows={3}
+                className="mt-2 w-full resize-none rounded-lg border border-gray-200 bg-gray-50 p-3 text-sm text-gray-800 focus:border-emerald-400 focus:bg-white focus:outline-none focus:ring-2 focus:ring-emerald-200"
+                placeholder="Describe the startups you want to back…"
+              />
+              <p className="mt-2 text-xs text-gray-400">
+                Angent scans GitHub & Hacker News for startups active in the last 90 days, then
+                scores each against this thesis.
+              </p>
             </div>
 
             <LoopStatusDisplay

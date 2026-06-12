@@ -12,14 +12,19 @@ export const dynamic = "force-dynamic";
 
 let running = false;
 
-export async function POST() {
+export async function POST(req: Request) {
   if (running) return NextResponse.json({ ok: true, already: true, running: true });
+  const body = await req.json().catch(() => ({} as { thesis?: string }));
   const cwd = path.join(process.cwd(), "..");
   const env = { ...process.env, PIONEER_API_KEY: "" };
+  const args = ["-m", "angent.main", "--demo"];
+  if (body && typeof body.thesis === "string" && body.thesis.trim()) {
+    args.push("--thesis", body.thesis.trim());
+  }
   const candidates = ["python", "py", "python3"];
   for (const bin of candidates) {
     try {
-      const child = spawn(bin, ["-m", "angent.main", "--demo"], {
+      const child = spawn(bin, args, {
         cwd,
         env,
         detached: true,

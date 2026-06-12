@@ -25,12 +25,21 @@ failure-entry handling lands in task 5.4).
 
 from __future__ import annotations
 
+import json
+import logging
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
 import requests
 
 from angent.models import Candidate, TickPlan
+
+if TYPE_CHECKING:  # avoid a hard import cycle; only needed for type hints
+    from angent.persistence.clickhouse import ClickHouseClient
+
+logger = logging.getLogger("angent.agents.scanner")
 
 
 # --- Signal-source contract -------------------------------------------------
@@ -817,3 +826,320 @@ class HuggingFaceSource:
         if isinstance(value, str) and value.strip().isdigit():
             return max(0, int(value.strip()))
         return 0
+
+
+# --- Scanner orchestrator (dedup/upsert + per-source retry) ----------------
+
+# Hard 90-day recency window the Scanner derives for every Tick (Requirement 4).
+_SCAN_WINDOW_DAYS = 90
+
+# Per-source retry budget (Requirement 4.5): retry a failing source up to 3
+# times before recording a failure entry and moving on.
+_SOURCE_MAX_ATTEMPTS = 3
+
+# fit_score sentinel for an unscored candidate (the Qualifier fills this in
+# later). Matches the design's "Int32, default -1 = unscored".
+_UNSCORED = -1
+
+# Column order for the ``companies`` table, reused for every insert so writes
+# stay in lock-step with the schema in persistence/clickhouse.py.
+_COMPANIES_COLUMNS: tuple[str, ...] = (
+    "company_id",
+    "source",
+    "source_unique_id",
+    "name",
+    "url",
+    "signals",
+    "first_activity",
+    "fit_score",
+    "fit_explanation",
+    "created_at",
+    "updated_at",
+    "version",
+)
+
+
+@dataclass
+class SourceFailure:
+    """A signal source that exhausted its retries during a scan (Requirement 4.5).
+
+    Recorded so the Tick can complete with the remaining sources while the
+    failure remains observable in the :class:`ScanResult` and the logs.
+    """
+
+    source: str
+    error: str
+    attempts: int
+
+
+@dataclass
+class ScanResult:
+    """Summary of one :meth:`Scanner.scan` run.
+
+    ``candidates`` is every candidate the enabled sources returned this Tick.
+    ``inserted`` counts brand-new ``companies`` rows, ``upserted`` counts matches
+    on ``(source, source_unique_id)`` rewritten with a bumped version, and
+    ``failures`` lists the sources that failed after 3 attempts. ``persist_errors``
+    counts candidates whose ClickHouse write exhausted its own bounded retry.
+    """
+
+    candidates: list[Candidate] = field(default_factory=list)
+    inserted: int = 0
+    upserted: int = 0
+    failures: list[SourceFailure] = field(default_factory=list)
+    persist_errors: int = 0
+
+
+def _to_utc_aware(dt: Optional[datetime]) -> datetime:
+    """Normalize a datetime to timezone-aware UTC for ClickHouse ``DateTime`` writes.
+
+    Using tz-aware UTC values makes the driver's conversion deterministic so a
+    value round-trips stably (a naive write is interpreted in the local/session
+    timezone, which silently shifts ``created_at`` across an upsert). A naive
+    input is treated as already being UTC (that is how the driver returns the
+    tz-less ``DateTime`` column on read), and ``None`` defaults to now
+    (``first_activity`` is non-nullable in the schema).
+    """
+    if dt is None:
+        return datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+class Scanner:
+    """Runs the enabled signal sources and writes candidates to ``companies``.
+
+    The Scanner is the Tick's discovery stage (Requirement 4). It:
+
+    * runs each enabled :class:`SignalSource` (respecting ``plan.sources`` when
+      the Planner narrows the set), retrying a failing source up to 3 times and,
+      on total failure, recording a :class:`SourceFailure`, continuing with the
+      remaining sources, and still completing the Tick (Requirement 4.5);
+    * inserts candidates not already present in ``companies`` with source
+      attribution and a fresh ``company_id`` (Requirement 4.3); and
+    * upserts matches on ``(source, source_unique_id)`` by preserving the
+      original ``created_at``/``company_id`` and bumping ``version``/``updated_at``
+      so the ``ReplacingMergeTree`` resolves to the latest row (Requirement 4.4).
+
+    The sources can be injected; otherwise sensible defaults are built from the
+    :class:`~angent.config.Config`: Hacker News always, GitHub when Airbyte
+    credentials are present, and Hugging Face only when explicitly enabled.
+    """
+
+    def __init__(
+        self,
+        client: "ClickHouseClient",
+        sources: Optional[list[SignalSource]] = None,
+        *,
+        config: Optional["object"] = None,
+        enable_huggingface: bool = False,
+    ) -> None:
+        self._client = client
+        if sources is None:
+            sources = self._default_sources(config, enable_huggingface=enable_huggingface)
+        self._sources: list[SignalSource] = list(sources)
+
+    # -- defaults ------------------------------------------------------------
+
+    @staticmethod
+    def _default_sources(
+        config: Optional["object"], *, enable_huggingface: bool
+    ) -> list[SignalSource]:
+        """Build the default source set: HN always, GitHub if Airbyte creds, HF if flagged."""
+        if config is None:
+            from angent.config import load_config
+
+            config = load_config()
+
+        sources: list[SignalSource] = [HackerNewsSource()]
+
+        airbyte = getattr(config, "airbyte", None)
+        if airbyte is not None and getattr(airbyte, "is_configured", False):
+            sources.append(GitHubSource(config=config))
+
+        if enable_huggingface:
+            sources.append(HuggingFaceSource(config=config, enabled=True))
+
+        return sources
+
+    @property
+    def sources(self) -> list[SignalSource]:
+        return list(self._sources)
+
+    # -- public API ----------------------------------------------------------
+
+    def scan(self, plan: TickPlan) -> ScanResult:
+        """Run the enabled sources for ``plan`` and dedup/upsert into ``companies``.
+
+        Steps (Requirement 4.3, 4.4, 4.5):
+          1. Derive ``since`` = now - 90 days (the hard recency window).
+          2. For each enabled source (filtered by ``plan.sources`` when set),
+             call ``fetch`` with up to 3 retry attempts; on total failure record
+             a :class:`SourceFailure` and continue.
+          3. Insert new candidates / upsert existing ones, preserving the
+             original ``created_at`` and ``company_id`` on upsert.
+
+        Returns a :class:`ScanResult` summarizing inserted/upserted counts, the
+        per-source failures, and every candidate discovered this Tick.
+        """
+        since = datetime.now(timezone.utc) - timedelta(days=_SCAN_WINDOW_DAYS)
+        result = ScanResult()
+
+        for source in self._enabled_sources(plan):
+            candidates = self._fetch_with_retry(source, plan, since, result)
+            for candidate in candidates:
+                result.candidates.append(candidate)
+                self._persist_candidate(candidate, result)
+
+        logger.info(
+            "Scan complete: %d candidate(s), %d inserted, %d upserted, "
+            "%d source failure(s), %d persist error(s)",
+            len(result.candidates),
+            result.inserted,
+            result.upserted,
+            len(result.failures),
+            result.persist_errors,
+        )
+        return result
+
+    # -- source orchestration ------------------------------------------------
+
+    def _enabled_sources(self, plan: TickPlan) -> list[SignalSource]:
+        """Return the sources to run this Tick, honoring ``plan.sources`` if set.
+
+        When the Planner provides a non-empty ``plan.sources`` list, only sources
+        whose ``name`` appears in it run; otherwise every configured source runs.
+        """
+        wanted = getattr(plan, "sources", None) or []
+        if not wanted:
+            return list(self._sources)
+        wanted_set = {str(name) for name in wanted}
+        return [s for s in self._sources if getattr(s, "name", None) in wanted_set]
+
+    def _fetch_with_retry(
+        self,
+        source: SignalSource,
+        plan: TickPlan,
+        since: datetime,
+        result: ScanResult,
+    ) -> list[Candidate]:
+        """Call ``source.fetch`` up to 3 times; record a failure on total failure.
+
+        A source that raises is retried up to :data:`_SOURCE_MAX_ATTEMPTS` times.
+        If every attempt raises, a :class:`SourceFailure` is appended to
+        ``result.failures`` and an empty list is returned so the scan continues
+        with the remaining sources and still completes the Tick (Requirement 4.5).
+        """
+        name = getattr(source, "name", source.__class__.__name__)
+        last_error: Optional[str] = None
+        for attempt in range(1, _SOURCE_MAX_ATTEMPTS + 1):
+            try:
+                return source.fetch(plan, since)
+            except Exception as exc:  # noqa: BLE001 - retry any source error
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "Signal source %r attempt %d/%d failed: %s",
+                    name,
+                    attempt,
+                    _SOURCE_MAX_ATTEMPTS,
+                    last_error,
+                )
+
+        result.failures.append(
+            SourceFailure(source=name, error=last_error or "unknown error",
+                          attempts=_SOURCE_MAX_ATTEMPTS)
+        )
+        logger.error(
+            "Signal source %r failed after %d attempts; continuing with remaining sources",
+            name,
+            _SOURCE_MAX_ATTEMPTS,
+        )
+        return []
+
+    # -- dedup / upsert ------------------------------------------------------
+
+    def _persist_candidate(self, candidate: Candidate, result: ScanResult) -> None:
+        """Insert a new candidate or upsert an existing one into ``companies``.
+
+        Looks up the current row by ``(source, source_unique_id)``. If absent,
+        inserts a new row (fresh ``company_id``, ``version=1``, unscored). If
+        present, rewrites the row preserving the original ``company_id`` and
+        ``created_at`` while bumping ``version``/``updated_at`` so the
+        ``ReplacingMergeTree`` keeps the latest version (Requirement 4.3, 4.4).
+        """
+        existing = self._find_existing(candidate)
+        now = datetime.now(timezone.utc)
+        signals_json = json.dumps(candidate.signals or {}, default=str)
+        first_activity = _to_utc_aware(candidate.first_activity)
+
+        if existing is None:
+            company_id = str(uuid.uuid4())
+            row = [
+                company_id,
+                candidate.source,
+                candidate.source_unique_id,
+                candidate.name,
+                candidate.url,
+                signals_json,
+                first_activity,
+                _UNSCORED,
+                "",            # fit_explanation — filled by the Qualifier later
+                now,           # created_at
+                now,           # updated_at
+                1,             # version
+            ]
+            write = self._client.insert("companies", [row], list(_COMPANIES_COLUMNS))
+            if write.ok:
+                result.inserted += 1
+            else:
+                result.persist_errors += 1
+            return
+
+        company_id, created_at, fit_score, fit_explanation, version = existing
+        row = [
+            company_id,                       # preserve original id
+            candidate.source,
+            candidate.source_unique_id,
+            candidate.name,                   # refresh mutable fields
+            candidate.url,
+            signals_json,
+            first_activity,
+            int(fit_score) if fit_score is not None else _UNSCORED,
+            fit_explanation or "",            # preserve any existing explanation
+            _to_utc_aware(created_at),         # preserve original created_at
+            now,                              # bump updated_at
+            int(version) + 1,                 # bump version -> latest wins
+        ]
+        write = self._client.insert("companies", [row], list(_COMPANIES_COLUMNS))
+        if write.ok:
+            result.upserted += 1
+        else:
+            result.persist_errors += 1
+
+    def _find_existing(
+        self, candidate: Candidate
+    ) -> Optional[tuple[str, datetime, int, str, int]]:
+        """Return the latest existing row for this candidate, or ``None``.
+
+        Selects the highest-version row for ``(source, source_unique_id)`` so the
+        upsert can preserve the original ``company_id``/``created_at`` and bump
+        from the current ``version``. On a read failure returns ``None`` (the
+        candidate is then treated as new — at worst a harmless extra version that
+        the ``ReplacingMergeTree`` collapses on the natural key).
+        """
+        read = self._client.query(
+            "SELECT company_id, created_at, fit_score, fit_explanation, version "
+            "FROM companies "
+            "WHERE source = {source:String} "
+            "AND source_unique_id = {suid:String} "
+            "ORDER BY version DESC LIMIT 1",
+            parameters={
+                "source": candidate.source,
+                "suid": candidate.source_unique_id,
+            },
+        )
+        if not read.ok or not read.rows:
+            return None
+        company_id, created_at, fit_score, fit_explanation, version = read.rows[0]
+        return company_id, created_at, fit_score, fit_explanation, version

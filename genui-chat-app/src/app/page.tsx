@@ -10,7 +10,7 @@
 //     (Requirement 14), reusing the library.prompt() -> /api/chat -> <Renderer/>
 //     pipeline.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import LoopStatusDisplay from "../components/react-shell/LoopStatusDisplay";
 import QualifiedCompanyCard from "../components/react-shell/QualifiedCompanyCard";
@@ -141,24 +141,43 @@ export default function Home() {
   const [tab, setTab] = useState<Tab>("dashboard");
   const [data, setData] = useState<DashboardData | null>(null);
   const [live, setLive] = useState(false);
+  const [running, setRunning] = useState(false);
+
+  const loadData = useCallback(async () => {
+    try {
+      const r = await fetch("/api/dashboard", { cache: "no-store" });
+      const d = (await r.json()) as DashboardData & { ok: boolean };
+      if (d.ok && Array.isArray(d.companies) && d.companies.length > 0) {
+        setData(d);
+        setLive(true);
+      }
+    } catch {
+      /* keep demo fallback */
+    }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    fetch("/api/dashboard")
-      .then((r) => r.json())
-      .then((d: DashboardData & { ok: boolean }) => {
-        if (cancelled) return;
-        const hasReal = d.ok && Array.isArray(d.companies) && d.companies.length > 0;
-        setData(d);
-        setLive(hasReal);
-      })
-      .catch(() => {
-        /* keep demo fallback */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    loadData();
+  }, [loadData]);
+
+  const runAgent = useCallback(async () => {
+    setRunning(true);
+    try {
+      await fetch("/api/run", { method: "POST" });
+    } catch {
+      /* ignore */
+    }
+    // Poll the blackboard so new rows appear live while the agent runs.
+    let n = 0;
+    const id = setInterval(async () => {
+      await loadData();
+      n += 1;
+      if (n >= 30) {
+        clearInterval(id);
+        setRunning(false);
+      }
+    }, 2000);
+  }, [loadData]);
 
   // Real rows when the agent has populated ClickHouse; else representative data.
   const companies =
@@ -222,6 +241,16 @@ export default function Home() {
           </span>
         </div>
         <nav className="flex items-center gap-3">
+          <button
+            onClick={runAgent}
+            disabled={running}
+            className={`rounded-md px-3 py-1.5 text-sm font-semibold text-white shadow-sm transition ${
+              running ? "bg-emerald-500/70 cursor-wait" : "bg-emerald-600 hover:bg-emerald-700"
+            }`}
+            title="Run the Angent control loop and watch results populate"
+          >
+            {running ? "● Sourcing deals…" : "▶ Run Agent"}
+          </button>
           <span
             className={`hidden rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ring-inset sm:inline ${
               live

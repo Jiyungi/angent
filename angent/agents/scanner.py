@@ -610,3 +610,210 @@ class GitHubSource:
                 except ValueError:
                     continue
         return None
+
+
+# --- Hugging Face Hub source (stretch, feature-flagged) --------------------
+
+# Public Hugging Face Hub models endpoint. No auth required; an optional bearer
+# token (HUGGINGFACE_TOKEN) raises rate limits but is never mandatory. We sort
+# by creation time descending so the most recently created AI models surface
+# first and the 90-day window bounds the work (Requirement 4.6).
+_HF_MODELS_URL = "https://huggingface.co/api/models"
+
+# Per-source request budget (Requirement 4.6): the request completes within 30s.
+_HF_TIMEOUT_SECONDS = 30
+
+# Hard 90-day recency window (Requirement 4.6).
+_HF_WINDOW_DAYS = 90
+
+# How many models to request. Kept modest so a Tick stays fast; the Scanner
+# orchestrator (5.4) handles dedup/upsert across Ticks.
+_HF_LIMIT = 100
+
+
+class HuggingFaceSource:
+    """Hugging Face Hub signal source for newly-created AI models (Requirement 4.6).
+
+    Implements :class:`SignalSource`. This is a **stretch source gated behind a
+    feature flag**: it is disabled by default and returns an empty list unless
+    explicitly enabled (``enabled=True``), so a deployment opts in deliberately
+    and the Scanner only runs it when a Tick plan turns it on (task 5.4).
+
+    When enabled, each :meth:`fetch` issues one bounded request for the most
+    recently created models on the Hub (sorted by ``createdAt`` descending) and
+    maps every model created within the last 90 days (and at or after ``since``)
+    to a :class:`~angent.models.Candidate`:
+
+    * ``source`` = ``"huggingface"``
+    * ``source_unique_id`` = the model id (stable Hub natural key)
+    * ``name`` = the model id / name
+    * ``url`` = ``https://huggingface.co/{id}``
+    * ``signals`` = ``{"downloads": ..., "likes": ..., "pipeline_tag": ..., ...}``
+    * ``first_activity`` = the model's ``createdAt`` time
+
+    Graceful degradation: when disabled, or on any timeout/transport/parse error
+    or a non-list response, :meth:`fetch` returns an empty list rather than
+    raising, so the Scanner can continue with the remaining sources and still
+    complete the Tick. The HTTP session and config are injectable for testing.
+    """
+
+    name = "huggingface"
+
+    def __init__(
+        self,
+        config: Optional["object"] = None,
+        session: Optional[requests.Session] = None,
+        timeout: int = _HF_TIMEOUT_SECONDS,
+        limit: int = _HF_LIMIT,
+        *,
+        enabled: bool = False,
+    ) -> None:
+        # Lazy import keeps this module importable even if config wiring changes.
+        if config is None:
+            from angent.config import load_config
+
+            config = load_config()
+        self._config = config
+        self._token = getattr(config, "huggingface_token", None)
+        self._session = session or requests.Session()
+        self._timeout = timeout
+        self._limit = limit
+        # The feature flag: this stretch source stays off unless explicitly
+        # enabled, so it never runs by accident in the default configuration.
+        self._enabled = enabled
+
+    # -- public SignalSource interface --------------------------------------
+
+    def fetch(self, plan: TickPlan, since: datetime) -> list[Candidate]:
+        """Fetch newly-created Hugging Face model candidates in the 90-day window.
+
+        Returns an empty list (never raises) when the source is disabled by its
+        feature flag, when the Hub API is unreachable or times out, or when the
+        response carries no usable model records — so the Scanner can continue
+        with the remaining sources and still complete the Tick.
+        """
+        if not self._enabled:
+            # Feature flag off: this stretch source contributes nothing.
+            return []
+
+        records = self._fetch_models()
+        if not records:
+            return []
+
+        floor = self._window_floor(since)
+        candidates: dict[str, Candidate] = {}
+        for record in records:
+            candidate = self._to_candidate(record, floor=floor)
+            if candidate is not None:
+                candidates.setdefault(candidate.source_unique_id, candidate)
+        return list(candidates.values())
+
+    # -- internals -----------------------------------------------------------
+
+    def _fetch_models(self) -> list[dict]:
+        """Issue one bounded Hub request for the newest models and return records.
+
+        Sorts by ``createdAt`` descending so the freshest models lead, requests
+        the ``createdAt``/``downloads``/``likes`` fields explicitly, and attaches
+        the optional bearer token when present. A timeout, transport error,
+        non-2xx status, or invalid JSON returns an empty list instead of raising.
+        """
+        headers = {"Accept": "application/json"}
+        if isinstance(self._token, str) and self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+
+        params = {
+            "sort": "createdAt",
+            "direction": -1,
+            "limit": self._limit,
+            "full": "true",
+        }
+
+        try:
+            response = self._session.get(
+                _HF_MODELS_URL,
+                params=params,
+                headers=headers,
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            return []
+
+        return [item for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+    def _window_floor(self, since: datetime) -> datetime:
+        """Return the effective lower time bound: max(since, now - 90 days)."""
+        now = datetime.now(timezone.utc)
+        ninety_days_ago = now - timedelta(days=_HF_WINDOW_DAYS)
+        bound = since
+        if bound.tzinfo is None:
+            bound = bound.replace(tzinfo=timezone.utc)
+        else:
+            bound = bound.astimezone(timezone.utc)
+        return max(bound, ninety_days_ago)
+
+    def _to_candidate(self, record: dict, *, floor: datetime) -> Optional[Candidate]:
+        """Map one Hub model record to a Candidate, or None to skip it.
+
+        Skips records without a model id, and records created before the 90-day
+        floor (Requirement 4.6). Downloads/likes are coerced to non-negative ints
+        for the ``signals`` payload.
+        """
+        if not isinstance(record, dict):
+            return None
+
+        model_id = record.get("id") or record.get("modelId")
+        if not model_id or not isinstance(model_id, str):
+            return None
+
+        first_activity = self._parse_created_at(record)
+        if first_activity is not None and first_activity < floor:
+            return None
+
+        return Candidate(
+            source=HuggingFaceSource.name,
+            source_unique_id=model_id,
+            name=model_id,
+            url=f"https://huggingface.co/{model_id}",
+            signals={
+                "downloads": self._as_int(record.get("downloads")),
+                "likes": self._as_int(record.get("likes")),
+                "pipeline_tag": record.get("pipeline_tag"),
+                "library_name": record.get("library_name"),
+                "author": record.get("author"),
+            },
+            first_activity=first_activity,
+        )
+
+    @staticmethod
+    def _parse_created_at(record: dict) -> Optional[datetime]:
+        """Extract the model's ``createdAt`` as a tz-aware UTC datetime.
+
+        Hugging Face returns ISO8601 strings such as
+        ``"2024-01-02T03:04:05.000Z"``. Returns ``None`` when missing or
+        unparseable so the record is kept (the floor check then no-ops).
+        """
+        created_at = record.get("createdAt") or record.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            try:
+                normalized = created_at.replace("Z", "+00:00")
+                parsed = datetime.fromisoformat(normalized)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.astimezone(timezone.utc)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _as_int(value: object) -> int:
+        """Coerce a Hub numeric field to a non-negative int (0 on failure)."""
+        if isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+        if isinstance(value, str) and value.strip().isdigit():
+            return max(0, int(value.strip()))
+        return 0

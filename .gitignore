@@ -1,4 +1,4 @@
-# Secrets — never commit
+# Secrets -- never commit real env files, but keep the template
 .env
 .env.*
 !.env.template
@@ -6,11 +6,25 @@
 # Node
 node_modules/
 
+# Next.js build artifacts
+.next/
+out/
+
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Local Deal_Memo fallback files (written when Senso is unreachable)
+Deal_Memo*.md
+deal_memo*.md
+deal_memos/
 
 # Logs / temp
 *.log

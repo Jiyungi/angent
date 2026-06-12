@@ -6,7 +6,8 @@
   "scripts": {
     "server": "node server.mjs",
     "deal-memo": "node deal_memo_server.mjs",
-    "buyer": "node buyer.mjs"
+    "buyer": "node buyer.mjs",
+    "deal-memo-buyer": "node deal_memo_buyer.mjs"
   },
   "dependencies": {
     "@x402/core": "^2.14.0",

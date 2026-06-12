@@ -42,6 +42,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 from .config import load_config
+from .demo_config import demo_goal, load_seeded_outcomes
 from .loop.control_loop import ControlLoop, RunResult
 from .models import Goal
 from .observability.logging import StageLogger
@@ -101,6 +102,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--smoke",
         action="store_true",
         help="Fast smoke run: tiny budget + 1 Tick so wiring is exercised quickly.",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help=(
+            "Demo run: use the configured demo Goal (target in [0,1], now+120s "
+            "deadline, 8-email budget) and seed historical outcomes before the "
+            "first Tick."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -170,11 +180,14 @@ def main(argv: list[str] | None = None) -> int:
     loop = ControlLoop(client, thesis=thesis, config=config)
 
     # 5. Goal initiation (all-or-nothing) -----------------------------------
-    goal = Goal(
-        target_metric=target_metric,
-        deadline=datetime.now() + timedelta(minutes=deadline_minutes),
-        email_budget=email_budget,
-    )
+    if args.demo:
+        goal = demo_goal()
+    else:
+        goal = Goal(
+            target_metric=target_metric,
+            deadline=datetime.now() + timedelta(minutes=deadline_minutes),
+            email_budget=email_budget,
+        )
     start_result = loop.start(thesis, goal)
     if not start_result.ok:
         stage.progress(
@@ -195,6 +208,18 @@ def main(argv: list[str] | None = None) -> int:
         target_metric=goal.target_metric,
         email_budget=goal.email_budget,
     )
+
+    # In demo mode, seed historical outcomes BEFORE the first Tick so the
+    # scorer/analytics start with prior reply/open signal (Requirement 12.5).
+    if args.demo:
+        seed_result = load_seeded_outcomes(client, run_id=run_id)
+        stage.progress(
+            "Seeded historical outcomes",
+            run_id=run_id,
+            seeded=len(seed_result.stored),
+            requested=seed_result.requested,
+            unstored=len(seed_result.unstored),
+        )
 
     # 6. Drive the loop inside a tracer step, then emit per-stage records ----
     with tracer.trace_step("control_loop.run", input={"run_id": run_id}) as step:

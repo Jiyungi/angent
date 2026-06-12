@@ -124,6 +124,25 @@ class StoreResult:
         return self.ok
 
 
+@dataclass
+class ReplyRateBucket:
+    """One 24-hour interval of reply-rate analytics for a run (Requirement 12.4).
+
+    Attributes:
+        bucket_start: Start of the 24-hour interval (``toStartOfInterval`` of the
+            email ``sent_at`` / outcome ``occurred_at``).
+        emails_sent: Distinct emails sent within this interval.
+        replies: Distinct reply outcomes within this interval.
+        reply_rate: ``replies / emails_sent`` for the interval, or ``0.0`` when no
+            emails were sent in it.
+    """
+
+    bucket_start: Any
+    emails_sent: int
+    replies: int
+    reply_rate: float
+
+
 class Optimizer:
     """Collects reply/open outcomes, stores them durably, and feeds learning.
 
@@ -441,18 +460,219 @@ class Optimizer:
             outcome_id=outcome_id,
         )
 
-    # -- reply-rate (implemented in a later task) ----------------------------
+    # -- reply-rate (scalar + per-24h buckets + persistence) -----------------
 
     def compute_reply_rate(self, run_id: str) -> float:
-        """Reply-rate = replies / emails sent for the run (Requirement 6.8).
+        """Reply-rate = replies / emails sent for the run (Requirements 6.7, 6.8).
 
-        Stubbed here on purpose: the reply-rate computation and its persistence
-        are implemented in a dedicated follow-up task. Calling it now raises so
-        the gap is explicit rather than silently returning a wrong number.
+        Scalar metric = ``count(distinct reply outcomes) / count(sent emails)``
+        for ``run_id``, returning ``0.0`` when no emails were sent (so the metric
+        is always well-defined and never divides by zero).
+
+        Both counts come from ClickHouse aggregations:
+
+        * **Emails sent** — the ``emails`` table is a ``ReplacingMergeTree(version)``
+          keyed by ``email_id``, so a single email can have several versioned
+          rows (created → approved → sent). We collapse to the *latest* version
+          per ``email_id`` with ``argMax(sent, version)`` and count only those
+          whose latest version has ``sent = 1``. This counts **distinct sent
+          emails** and never double-counts versioned rows.
+        * **Replies** — the ``outcomes`` table is a plain ``MergeTree`` (no
+          dedupe), so we use ``count(distinct outcome_id)`` for ``kind = 'reply'``
+          to avoid counting any duplicate-inserted reply rows twice.
+
+        Returns ``0.0`` when there is no client, a query fails, or no emails were
+        sent — the metric stays resilient and observable rather than crashing the
+        loop (Requirement 12.6).
         """
-        raise NotImplementedError(
-            "compute_reply_rate is implemented in a later task (Requirement 6.8)"
+        emails_sent = self._count_emails_sent(run_id)
+        if emails_sent <= 0:
+            return 0.0
+        replies = self._count_replies(run_id)
+        return replies / emails_sent
+
+    def _count_emails_sent(self, run_id: str) -> int:
+        """Count distinct emails whose latest version has ``sent = 1`` for ``run_id``."""
+        if self._client is None:
+            return 0
+        try:
+            result = self._client.query(
+                "SELECT count() FROM ("
+                "  SELECT email_id, argMax(sent, version) AS latest_sent "
+                "  FROM emails WHERE run_id = {run_id:String} "
+                "  GROUP BY email_id"
+                ") WHERE latest_sent = 1",
+                parameters={"run_id": run_id},
+            )
+        except Exception as exc:  # noqa: BLE001 - read failure -> 0 (resilient)
+            logger.warning("Optimizer: count emails_sent failed: %s", exc)
+            return 0
+        if not getattr(result, "ok", False) or not result.rows:
+            return 0
+        return int(result.rows[0][0] or 0)
+
+    def _count_replies(self, run_id: str) -> int:
+        """Count distinct ``kind='reply'`` outcomes for ``run_id``."""
+        if self._client is None:
+            return 0
+        try:
+            result = self._client.query(
+                "SELECT count(DISTINCT outcome_id) FROM outcomes "
+                "WHERE run_id = {run_id:String} AND kind = 'reply'",
+                parameters={"run_id": run_id},
+            )
+        except Exception as exc:  # noqa: BLE001 - read failure -> 0 (resilient)
+            logger.warning("Optimizer: count replies failed: %s", exc)
+            return 0
+        if not getattr(result, "ok", False) or not result.rows:
+            return 0
+        return int(result.rows[0][0] or 0)
+
+    def reply_rate_buckets(self, run_id: str) -> list["ReplyRateBucket"]:
+        """Per-24-hour-interval reply-rate aggregation across the run (Requirement 12.4).
+
+        Aggregates reply counts (on ``outcomes.occurred_at``) and sent-email
+        counts (on the latest ``emails.sent_at``) into 24-hour buckets via
+        ``toStartOfInterval(..., INTERVAL 24 HOUR)``, then merges them on the
+        bucket start so each returned :class:`ReplyRateBucket` carries that
+        interval's ``sent``, ``replies`` and ``rate`` (``replies / sent``, or
+        ``0.0`` when no emails were sent in the bucket). The union of bucket
+        starts spans the run's send + reply activity, giving the observable
+        trend across the full run duration.
+
+        Returns an empty list when there is no client or both queries come back
+        empty / failed — callers treat "no data" as a flat (empty) trend.
+        """
+        sent_by_bucket = self._sent_counts_by_bucket(run_id)
+        reply_by_bucket = self._reply_counts_by_bucket(run_id)
+
+        bucket_starts = sorted(set(sent_by_bucket) | set(reply_by_bucket))
+        buckets: list[ReplyRateBucket] = []
+        for start in bucket_starts:
+            sent = int(sent_by_bucket.get(start, 0))
+            replies = int(reply_by_bucket.get(start, 0))
+            rate = (replies / sent) if sent > 0 else 0.0
+            buckets.append(
+                ReplyRateBucket(
+                    bucket_start=start,
+                    emails_sent=sent,
+                    replies=replies,
+                    reply_rate=rate,
+                )
+            )
+        return buckets
+
+    def _sent_counts_by_bucket(self, run_id: str) -> dict[Any, int]:
+        """Map 24h bucket start -> count of distinct sent emails (latest version)."""
+        if self._client is None:
+            return {}
+        try:
+            result = self._client.query(
+                "SELECT toStartOfInterval(latest_sent_at, INTERVAL 24 HOUR) AS bucket, "
+                "       count() AS sent "
+                "FROM ("
+                "  SELECT email_id, "
+                "         argMax(sent, version) AS latest_sent, "
+                "         argMax(sent_at, version) AS latest_sent_at "
+                "  FROM emails WHERE run_id = {run_id:String} "
+                "  GROUP BY email_id"
+                ") "
+                "WHERE latest_sent = 1 AND latest_sent_at IS NOT NULL "
+                "GROUP BY bucket ORDER BY bucket",
+                parameters={"run_id": run_id},
+            )
+        except Exception as exc:  # noqa: BLE001 - resilient
+            logger.warning("Optimizer: sent-by-bucket query failed: %s", exc)
+            return {}
+        if not getattr(result, "ok", False) or not result.rows:
+            return {}
+        return {row[0]: int(row[1] or 0) for row in result.rows}
+
+    def _reply_counts_by_bucket(self, run_id: str) -> dict[Any, int]:
+        """Map 24h bucket start -> count of distinct reply outcomes."""
+        if self._client is None:
+            return {}
+        try:
+            result = self._client.query(
+                "SELECT toStartOfInterval(occurred_at, INTERVAL 24 HOUR) AS bucket, "
+                "       count(DISTINCT outcome_id) AS replies "
+                "FROM outcomes "
+                "WHERE run_id = {run_id:String} AND kind = 'reply' "
+                "GROUP BY bucket ORDER BY bucket",
+                parameters={"run_id": run_id},
+            )
+        except Exception as exc:  # noqa: BLE001 - resilient
+            logger.warning("Optimizer: reply-by-bucket query failed: %s", exc)
+            return {}
+        if not getattr(result, "ok", False) or not result.rows:
+            return {}
+        return {row[0]: int(row[1] or 0) for row in result.rows}
+
+    def persist_reply_rate(
+        self, run_id: str, reply_rate: Optional[float] = None
+    ) -> Optional[float]:
+        """Persist the current reply-rate to ``loop_state`` for ``run_id`` (Req 6.8, 12.3, 22).
+
+        Reads the latest :class:`~angent.models.LoopState` for the run, updates
+        its ``reply_rate`` (computing it via :meth:`compute_reply_rate` when not
+        supplied), and writes the state back through the persistence layer's
+        ``write_loop_state`` (latest-version-wins on the ``loop_state``
+        ``ReplacingMergeTree``), so any subsequent read returns the updated
+        metric and the trend is observable across all Ticks.
+
+        Intended to be called once per Tick (by the Optimizer or the
+        ControlLoop). It is resilient: returns ``None`` when there is no client,
+        the client lacks loop-state persistence, no state exists yet for the run,
+        or the write fails — never raising into the loop. On success it returns
+        the persisted ``reply_rate``.
+        """
+        if reply_rate is None:
+            reply_rate = self.compute_reply_rate(run_id)
+
+        client = self._client
+        if client is None or not hasattr(client, "read_loop_state") or not hasattr(
+            client, "write_loop_state"
+        ):
+            logger.warning(
+                "Optimizer: cannot persist reply_rate for run_id=%s "
+                "(no loop_state-capable client)",
+                run_id,
+            )
+            return None
+
+        try:
+            state = client.read_loop_state(run_id)
+        except Exception as exc:  # noqa: BLE001 - resilient
+            logger.warning("Optimizer: read_loop_state failed for %s: %s", run_id, exc)
+            return None
+
+        if state is None:
+            logger.warning(
+                "Optimizer: no loop_state to update reply_rate for run_id=%s", run_id
+            )
+            return None
+
+        state.reply_rate = float(reply_rate)
+        try:
+            write_result = client.write_loop_state(state)
+        except Exception as exc:  # noqa: BLE001 - resilient
+            logger.warning("Optimizer: write_loop_state failed for %s: %s", run_id, exc)
+            return None
+
+        if not getattr(write_result, "ok", True):
+            logger.error(
+                "Optimizer: persist reply_rate for run_id=%s returned not-ok: %s",
+                run_id,
+                getattr(write_result, "error", None),
+            )
+            return None
+
+        logger.info(
+            "Optimizer: persisted reply_rate=%.4f to loop_state for run_id=%s",
+            reply_rate,
+            run_id,
         )
+        return reply_rate
 
     # -- helpers -------------------------------------------------------------
 

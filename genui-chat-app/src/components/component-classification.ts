@@ -19,6 +19,16 @@
 // Directory convention reinforces the manifest:
 //   src/components/openui/      -> "openui-generated"  (NEVER polished)
 //   src/components/react-shell/ -> "react-shell"       (Impeccable-polishable)
+//
+// Cross-stack output-type separation (Requirement 20.6):
+//   The OpenUI deep-dive (src/components/openui/CompanyDeepDive.tsx) renders
+//   ClickHouse company data (name, url, source, fit_score, fit_explanation,
+//   signals) as OpenUI Lang for the in-app HUMAN surface. The Python Publisher
+//   (angent/publisher.py :: Publisher.serialize) reads the SAME ClickHouse
+//   fields but emits a MARKDOWN Deal_Memo for cited.md — never OpenUI Lang —
+//   via a separate code path. The two output types share their data source but
+//   remain distinct and separate; the Publisher's `assert_markdown_not_openui`
+//   guard enforces that no OpenUI Lang ever leaks into the Deal_Memo.
 
 /** The two — and only two — component categories. */
 export type ComponentCategory = "openui-generated" | "react-shell";

@@ -19,11 +19,23 @@ This module (task 20.1) implements the markdown serializer only:
     fit_explanation, signals, AND a provenance citation line linking to the
     real source URL (Requirements 20.1, 20.2).
 
-The Deal_Memo is **always markdown** and is **never** OpenUI Lang — the two
-output types are produced by separate code paths and remain separate
-(Requirement 20.6, enforced by task 20.3). :meth:`Publisher.publish` is stubbed
-here and fully implemented (Senso call + persistence + local fallback) in
-task 20.2.
+The Deal_Memo is **always markdown** and is **never** OpenUI Lang. It is
+produced by THIS code path (the Publisher's markdown serializer), which is
+entirely separate from the OpenUI deep-dive surface
+(``genui-chat-app/src/components/openui/CompanyDeepDive.tsx``, Requirement 14).
+Both code paths read the **same** ClickHouse company fields
+(``_COMPANY_FIELDS``), but they emit two distinct output types that remain
+separate (Requirement 20.6):
+
+  * the Publisher → **markdown** Deal_Memo published to cited.md, and
+  * the OpenUI deep-dive → **OpenUI Lang** rendered by ``<Renderer/>`` for the
+    in-app human surface.
+
+:func:`assert_markdown_not_openui` makes this separation explicit and
+verifiable: it guards a serialized Deal_Memo against any OpenUI Lang markers so
+the two output types can never converge (Requirement 20.6, enforced by task
+20.3). :meth:`Publisher.publish` is stubbed here and fully implemented (Senso
+call + persistence + local fallback) in task 20.2.
 """
 
 from __future__ import annotations
@@ -184,6 +196,45 @@ def _parse_signals(raw: Any) -> dict:
         return parsed if isinstance(parsed, dict) else {"value": parsed}
     except (TypeError, ValueError):
         return {"raw": str(raw)}
+
+
+# --- Output-type separation guard (Requirement 20.6) ------------------------
+
+# OpenUI Lang / OpenUI-surface markers that must NEVER appear in a markdown
+# Deal_Memo. These are structural DSL/identifier tokens specific to the
+# OpenUI-generated deep-dive surface (Requirement 14,
+# ``genui-chat-app/src/components/openui``) — they have no place in the
+# Publisher's markdown output. Kept narrow so legitimate company prose (fit
+# explanations, signals) never trips the guard.
+_OPENUI_LANG_MARKERS: tuple[str, ...] = (
+    "<Renderer",        # OpenUI Lang is rendered by the <Renderer/> element
+    "openuiLibrary",    # OpenUI Lang prompt/library handle
+    "openuiPromptOptions",
+    "componentLibrary",
+    "streamProtocol",
+    "@openuidev",        # OpenUI React package namespace
+    "processMessage",
+)
+
+
+def assert_markdown_not_openui(text: str) -> None:
+    """Guard that ``text`` is a markdown Deal_Memo and not OpenUI Lang.
+
+    The Deal_Memo is markdown ONLY and is produced by this Publisher code path,
+    which is separate from the OpenUI deep-dive surface (Requirement 14). That
+    deep-dive renders the **same** ClickHouse company data as the in-app human
+    surface, but as OpenUI Lang via ``<Renderer/>`` — a distinct output type.
+    This guard affirms the two output types remain separate (Requirement 20.6)
+    by ensuring no OpenUI Lang markers leak into the published Deal_Memo.
+
+    Raises :class:`ValueError` if any OpenUI Lang marker is found.
+    """
+    found = [marker for marker in _OPENUI_LANG_MARKERS if marker in text]
+    if found:
+        raise ValueError(
+            "Deal_Memo must be markdown, not OpenUI Lang (Requirement 20.6); "
+            f"found OpenUI Lang marker(s): {', '.join(found)}"
+        )
 
 
 # --- Publisher --------------------------------------------------------------

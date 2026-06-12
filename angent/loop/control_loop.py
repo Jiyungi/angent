@@ -25,18 +25,48 @@ with bounded retry (retaining it in memory on total failure).
 from __future__ import annotations
 
 import dataclasses
+import contextlib
 import logging
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Iterator, List, Optional
 
 from ..models import Goal, LoopState, StopReason, TickOutcome, TickPlan
 from ..persistence.clickhouse import ClickHouseClient
 from .planner import Planner
 from .validation import _as_naive, validate_goal
+
+
+@contextlib.contextmanager
+def _stage_span(name: str, **attributes: Any) -> Iterator[None]:
+    """Open a Langfuse span for a pipeline stage, or a no-op if unavailable.
+
+    Best-practice span hierarchy (Langfuse skill): each Tick stage
+    (``scanner.scan``, ``qualifier.qualify``, …) becomes a named child span so
+    the UI shows which stage is slow/failing, and OpenAI generations created by
+    the Qualifier/Writer drop-in nest underneath the right stage automatically.
+    Fully guarded: if Langfuse is not installed/configured this is a
+    ``nullcontext`` and never affects the loop (Requirement 13.3/13.4).
+    """
+    try:
+        from langfuse import get_client
+
+        client = get_client()
+    except Exception:  # noqa: BLE001 - not installed/configured -> no-op
+        client = None
+    if client is None:
+        yield
+        return
+    try:
+        with client.start_as_current_observation(
+            as_type="span", name=name, input=(attributes or None)
+        ):
+            yield
+    except Exception:  # noqa: BLE001 - tracing must never break a stage
+        yield
 
 logger = logging.getLogger("angent.loop.control_loop")
 
@@ -553,19 +583,21 @@ class ControlLoop:
 
         # 2. Run the five stages in order with per-stage failure containment.
         try:
-            scan_result = self.scanner.scan(plan)
+            with _stage_span("scanner.scan", sources=list(plan.sources)):
+                scan_result = self.scanner.scan(plan)
             candidates = list(getattr(scan_result, "candidates", []) or [])
             outcome.candidates_found = len(candidates)
         except Exception as exc:  # noqa: BLE001 - contain to this Tick (Req 2.5)
             return self._contain_failure(state, outcome, STAGE_SCANNER, exc, reply_rate)
 
         try:
-            qualify_result = self.qualifier.qualify(
-                candidates,
-                active_thesis,
-                self.scorer,
-                threshold=plan.qualification_threshold,
-            )
+            with _stage_span("qualifier.qualify", candidates=len(candidates)):
+                qualify_result = self.qualifier.qualify(
+                    candidates,
+                    active_thesis,
+                    self.scorer,
+                    threshold=plan.qualification_threshold,
+                )
             qualified = list(getattr(qualify_result, "qualified", []) or [])
             outcome.qualified_count = len(qualified)
         except Exception as exc:  # noqa: BLE001
@@ -575,16 +607,20 @@ class ControlLoop:
 
         try:
             remaining_budget = max(0, state.goal.email_budget - state.emails_sent)
-            draft_result = self.writer.draft(
-                qualified, plan, remaining_budget, run_id=state.run_id
-            )
+            with _stage_span(
+                "writer.draft", qualified=len(qualified), remaining_budget=remaining_budget
+            ):
+                draft_result = self.writer.draft(
+                    qualified, plan, remaining_budget, run_id=state.run_id
+                )
             drafts = list(getattr(draft_result, "drafts", draft_result) or [])
             outcome.drafts_created = len(drafts)
         except Exception as exc:  # noqa: BLE001
             return self._contain_failure(state, outcome, STAGE_WRITER, exc, reply_rate)
 
         try:
-            emails_sent_this_tick = self._send_drafts(state, drafts)
+            with _stage_span("sender.send", drafts=len(drafts)):
+                emails_sent_this_tick = self._send_drafts(state, drafts)
             outcome.emails_sent = emails_sent_this_tick
         except Exception as exc:  # noqa: BLE001
             # A send actually completed before the failure would have advanced
@@ -601,15 +637,16 @@ class ControlLoop:
 
         try:
             optimizer = self.optimizer_for(state.run_id)
-            collected = optimizer.collect()
-            store_result = optimizer.store(collected)
-            stored = list(getattr(store_result, "stored", []) or [])
-            replies_this_tick = sum(
-                1 for o in stored if getattr(o, "kind", None) == "reply"
-            )
-            # Feed newly stored outcomes to the active scorer before the next Tick.
-            optimizer.feed(self.scorer, stored)
-            reply_rate = optimizer.compute_reply_rate(state.run_id)
+            with _stage_span("optimizer.collect_store_feed"):
+                collected = optimizer.collect()
+                store_result = optimizer.store(collected)
+                stored = list(getattr(store_result, "stored", []) or [])
+                replies_this_tick = sum(
+                    1 for o in stored if getattr(o, "kind", None) == "reply"
+                )
+                # Feed newly stored outcomes to the active scorer before next Tick.
+                optimizer.feed(self.scorer, stored)
+                reply_rate = optimizer.compute_reply_rate(state.run_id)
             outcome.replies = replies_this_tick
             outcome.reply_rate = reply_rate
         except Exception as exc:  # noqa: BLE001

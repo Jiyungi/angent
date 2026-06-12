@@ -222,20 +222,24 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # 6. Drive the loop inside a tracer step, then emit per-stage records ----
-    with tracer.trace_step("control_loop.run", input={"run_id": run_id}) as step:
-        try:
-            result: RunResult = loop.run(
-                run_handle.state, thesis=thesis, max_ticks=max_ticks
-            )
-        except Exception as exc:  # noqa: BLE001 - surface, persist nothing partial
-            stage.sponsor_failure("control_loop", f"run raised: {exc}")
-            client.close()
-            return 1
-        step.output = {
-            "ticks": result.tick_count,
-            "stop_reason": result.stop_reason.value if result.stop_reason else None,
-            "persisted": result.persisted,
-        }
+    # ``propagate`` groups every Tick of this run under one session_id (the run
+    # id) and tags it, so the run is easy to find/filter in the Langfuse UI.
+    with tracer.propagate(session_id=run_id, tags=["angent", "control-loop"]):
+        with tracer.trace_step("control_loop.run", input={"run_id": run_id}) as step:
+            try:
+                result: RunResult = loop.run(
+                    run_handle.state, thesis=thesis, max_ticks=max_ticks
+                )
+            except Exception as exc:  # noqa: BLE001 - surface, persist nothing partial
+                stage.sponsor_failure("control_loop", f"run raised: {exc}")
+                tracer.flush()
+                client.close()
+                return 1
+            step.output = {
+                "ticks": result.tick_count,
+                "stop_reason": result.stop_reason.value if result.stop_reason else None,
+                "persisted": result.persisted,
+            }
     tracer.flush()
 
     _emit_stage_records(stage, result)

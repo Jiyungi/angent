@@ -454,11 +454,13 @@ class Writer:
             logger.info("Writer: TrueFoundry not configured; no drafts can be produced.")
             return None
         try:
-            from openai import OpenAI
+            # Langfuse-wrapped OpenAI drop-in when tracing is configured (auto
+            # records model/tokens/cost), else the plain OpenAI client.
+            from ..observability.llm import build_openai_client
         except ImportError:  # pragma: no cover - openai is a declared dependency
             logger.warning("Writer: openai SDK unavailable; no drafts can be produced.")
             return None
-        self._openai_client = OpenAI(
+        self._openai_client = build_openai_client(
             base_url=self._tf.base_url,
             api_key=self._tf.api_key,
         )

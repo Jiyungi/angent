@@ -2,71 +2,60 @@
 
 Covers:
   * Disabled fallback when Langfuse is unconfigured (Req 13.3) — no-op, logs.
-  * Trace + linked LLM span recording on the happy path (Req 13.1, 13.2).
-  * Write-failure resilience: retry 3x then continue uninterrupted (Req 13.4).
+  * Trace span + step output recording on the happy path (Req 13.1).
+  * Failure resilience: a tracing error never interrupts the step (Req 13.4).
+
+These use a fake client implementing the small slice of the Langfuse v3/v4 SDK
+the Tracer relies on (``start_as_current_observation`` /
+``update_current_span`` / ``flush``), so no live Langfuse backend is needed.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 
 import pytest
 
-from angent.observability.tracing import DEFAULT_MAX_RETRIES, Tracer
+from angent.observability.tracing import Tracer
 
 
 # --- Fakes -----------------------------------------------------------------
 
 
-class _FakeSpan:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.ended = False
-
-    def end(self, **kwargs):
-        self.ended = True
-
-
-class _FakeTrace:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.updates = []
-        self.spans = []
-
-    def update(self, **kwargs):
-        self.updates.append(kwargs)
-
-    def span(self, **kwargs):
-        s = _FakeSpan(**kwargs)
-        self.spans.append(s)
-        return s
-
-
 class _FakeClient:
-    """A well-behaved fake Langfuse client."""
+    """A well-behaved fake Langfuse client (v3/v4 surface)."""
 
     def __init__(self):
-        self.traces = []
+        self.spans = []
+        self.updates = []
         self.flushed = 0
 
-    def trace(self, **kwargs):
-        t = _FakeTrace(**kwargs)
-        self.traces.append(t)
-        return t
+    @contextmanager
+    def start_as_current_observation(self, *, as_type, name, input=None, **kw):
+        rec = {"as_type": as_type, "name": name, "input": input}
+        self.spans.append(rec)
+        yield rec
+
+    def update_current_span(self, **kwargs):
+        self.updates.append(kwargs)
 
     def flush(self):
         self.flushed += 1
 
 
 class _FailingClient:
-    """A client whose trace() always raises, to exercise retry/fallback."""
+    """A client whose span creation always raises, to exercise resilience."""
 
     def __init__(self):
-        self.trace_calls = 0
+        self.calls = 0
 
-    def trace(self, **kwargs):
-        self.trace_calls += 1
-        raise RuntimeError("simulated langfuse write failure")
+    def start_as_current_observation(self, **kwargs):
+        self.calls += 1
+        raise RuntimeError("simulated langfuse failure")
+
+    def update_current_span(self, **kwargs):
+        raise RuntimeError("should not be called")
 
     def flush(self):
         pass
@@ -78,7 +67,7 @@ class _FailingClient:
 def test_disabled_when_unconfigured(monkeypatch, caplog):
     monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
     monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
-    monkeypatch.delenv("LANGFUSE_HOST", raising=False)
+    monkeypatch.delenv("LANGFUSE_BASE_URL", raising=False)
 
     with caplog.at_level(logging.INFO, logger="angent.observability.tracing"):
         tracer = Tracer()
@@ -95,74 +84,72 @@ def test_disabled_methods_are_noops(monkeypatch):
 
     with tracer.trace_step("step-1", input={"x": 1}) as handle:
         handle.output = {"y": 2}
-        # Must not raise even though disabled.
         tracer.record_llm_span("prompt", "response", token_count=10)
 
-    assert handle.trace is None
+    assert handle.span is None
     assert handle.end_time is not None
+    with tracer.propagate(session_id="s", tags=["t"]):
+        pass
     tracer.flush()  # no-op, no raise
 
 
-# --- Happy path (Req 13.1, 13.2) ------------------------------------------
+def test_force_disabled():
+    tracer = Tracer(client=_FakeClient(), enabled=False)
+    assert tracer.enabled is False
 
 
-def test_records_trace_and_linked_span():
+# --- Happy path (Req 13.1) ------------------------------------------------
+
+
+def test_records_span_and_output():
     client = _FakeClient()
     tracer = Tracer(client=client)
 
     assert tracer.enabled is True
 
-    with tracer.trace_step("discover", input={"q": "ai"}) as handle:
+    with tracer.trace_step("qualifier.qualify", input={"q": "ai"}) as handle:
         handle.output = {"results": 3}
-        tracer.record_llm_span("the prompt", "the response", token_count=42)
 
-    # One trace recorded with step id + input.
-    assert len(client.traces) == 1
-    trace = client.traces[0]
-    assert trace.kwargs["name"] == "discover"
-    assert trace.kwargs["input"] == {"q": "ai"}
+    # One span recorded with the step name + input.
+    assert len(client.spans) == 1
+    assert client.spans[0]["name"] == "qualifier.qualify"
+    assert client.spans[0]["input"] == {"q": "ai"}
+    assert client.spans[0]["as_type"] == "span"
 
-    # Trace updated with output + timestamps within the step.
-    assert trace.updates
-    upd = trace.updates[-1]
-    assert upd["output"] == {"results": 3}
-    assert "start_time" in upd["metadata"] and "end_time" in upd["metadata"]
+    # Output + duration recorded on exit.
+    assert client.updates
+    assert client.updates[-1]["output"] == {"results": 3}
+    assert "duration_s" in client.updates[-1]["metadata"]
 
-    # One linked LLM span with prompt/response/token count.
-    assert len(trace.spans) == 1
-    span = trace.spans[0]
-    assert span.kwargs["input"] == "the prompt"
-    assert span.kwargs["output"] == "the response"
-    assert span.kwargs["metadata"]["token_count"] == 42
-    assert span.ended is True
-
-    # Flushed so the trace lands promptly.
+    tracer.flush()
     assert client.flushed >= 1
 
 
-# --- Write-failure resilience (Req 13.4) ----------------------------------
+def test_record_llm_span_creates_generation():
+    client = _FakeClient()
+    tracer = Tracer(client=client)
+    tracer.record_llm_span("the prompt", "the response", token_count=42, name="tf-call")
+    gen = [s for s in client.spans if s["as_type"] == "generation"]
+    assert gen and gen[0]["name"] == "tf-call"
 
 
-def test_write_failure_retries_then_continues(caplog):
+# --- Failure resilience (Req 13.4) ----------------------------------------
+
+
+def test_span_failure_does_not_interrupt_step(caplog):
     client = _FailingClient()
     tracer = Tracer(client=client)
 
     step_ran = False
     with caplog.at_level(logging.WARNING, logger="angent.observability.tracing"):
         with tracer.trace_step("flaky", input={}) as handle:
-            # The body must run uninterrupted despite the backend failing.
             step_ran = True
             handle.output = "done"
-            tracer.record_llm_span("p", "r", token_count=1)
 
     assert step_ran is True
-    # trace() retried exactly max_retries times.
-    assert client.trace_calls == DEFAULT_MAX_RETRIES
-    # No backend trace handle since creation failed.
-    assert handle.trace is None
-    # Failure was logged and the step still completed.
-    assert handle.end_time is not None
-    assert any("failed after" in r.message.lower() for r in caplog.records)
+    assert handle.span is None  # span creation failed
+    assert handle.end_time is not None  # step still completed
+    assert any("failed to start span" in r.message.lower() for r in caplog.records)
 
 
 if __name__ == "__main__":

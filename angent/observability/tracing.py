@@ -1,28 +1,33 @@
-"""Langfuse tracing wrapper with a safe disabled fallback.
+"""Langfuse tracing for the Angent control loop, with a safe disabled fallback.
 
-This module provides a thin :class:`Tracer` that records one trace per agent
-step (step id, input, output, start/end timestamps) and records each
-TrueFoundry LLM call as a linked span (prompt, response, token count).
+Built per the Langfuse skill (github.com/langfuse/skills →
+references/instrumentation.md) and the current Langfuse Python SDK docs
+(https://langfuse.com/docs/observability/overview). Best practices applied:
 
-Design contract (Requirement 13):
-  * 13.1 — record a trace per agent step within ~2s of completion.
-  * 13.2 — record each TrueFoundry call as a span linked to the current step.
-  * 13.3 — if Langfuse is not configured at startup, run untraced and log once
-           that tracing is disabled.
-  * 13.4 — if a trace/span write fails, retry up to 3 times, then continue the
-           step uninterrupted and log the failure. NEVER raise into the caller.
+- **Framework integration over manual instrumentation.** LLM calls are traced
+  automatically by the OpenAI drop-in (see :mod:`angent.observability.llm`),
+  which records model name, token usage, cost, latency and API errors as
+  *generation* observations — no hand-rolled LLM spans needed.
+- **Descriptive, nested spans.** :meth:`Tracer.trace_step` opens a named span
+  per agent step (``scanner.scan``, ``qualifier.qualify``, …) via the SDK's
+  ``start_as_current_observation``; OpenAI generations nest underneath the
+  active step automatically.
+- **Explicit, masked input/output.** Step input/output are set explicitly via
+  ``update_current_span`` so traces stay readable and don't leak unrelated args.
+- **Trace attributes.** :meth:`Tracer.propagate` attaches ``session_id`` (the
+  run id) and ``tags`` so a run's Ticks group together in the Langfuse UI.
+- **Flush before exit.** :meth:`Tracer.flush` is called at the end of the run so
+  a short-lived process actually ships its traces.
 
-The tracer is intentionally tolerant of the concrete Langfuse SDK shape. It
-only depends on a small duck-typed client interface so it can be exercised with
-a fake client in tests without a live Langfuse backend:
+Disabled fallback (Requirement 13.3): if Langfuse is not configured at startup
+(missing ``LANGFUSE_PUBLIC_KEY`` / ``LANGFUSE_SECRET_KEY``) or the SDK is not
+installed, the tracer runs as a no-op and logs once that tracing is disabled.
+Any tracing error degrades gracefully and never interrupts the step
+(Requirement 13.4).
 
-    client.trace(**kwargs) -> trace_handle
-    trace_handle.update(**kwargs)
-    trace_handle.span(**kwargs) -> span_handle
-    span_handle.end(**kwargs)          # optional
-    client.flush()                     # optional
-
-Any method may be missing or raise; the tracer degrades gracefully.
+Credentials (env, loaded from ``.env`` before this module is used):
+``LANGFUSE_PUBLIC_KEY``, ``LANGFUSE_SECRET_KEY``, ``LANGFUSE_BASE_URL`` (the SDK
+also accepts ``LANGFUSE_HOST``).
 """
 
 from __future__ import annotations
@@ -31,22 +36,23 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 
 logger = logging.getLogger("angent.observability.tracing")
 
-# Maximum write attempts for any single trace/span operation (Req 13.4).
+# Retained for backward compatibility with callers/tests that referenced it.
 DEFAULT_MAX_RETRIES = 3
 
 
 @dataclass
 class StepHandle:
-    """A lightweight handle to an in-flight step trace.
+    """A handle to an in-flight step, returned by :meth:`Tracer.trace_step`.
 
-    Even when tracing is disabled or the backend is unavailable, callers always
-    receive a handle so their ``with tracer.trace_step(...)`` blocks behave
-    identically. ``trace`` is the backend trace object when available, else None.
+    Callers always receive one (even when tracing is disabled) so their
+    ``with tracer.trace_step(...) as h:`` blocks behave identically and can set
+    ``h.output``. ``span`` is the backend observation when tracing is live,
+    else ``None``.
     """
 
     step_id: str
@@ -54,131 +60,168 @@ class StepHandle:
     start_time: float
     output: Any = None
     end_time: Optional[float] = None
-    trace: Any = None  # backend trace handle (None when disabled / failed)
+    span: Any = None
+    # Back-compat alias: older code referenced ``handle.trace``.
+    trace: Any = None
+
+
+def _langfuse_configured() -> bool:
+    """True when Langfuse public + secret keys are present in the environment."""
+    return bool(
+        os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")
+    )
 
 
 class Tracer:
-    """A safe, retrying wrapper over the Langfuse SDK.
+    """Thin wrapper over the Langfuse SDK with a safe disabled fallback.
 
-    When Langfuse is not configured (missing public/secret keys) or its SDK is
-    unavailable, the tracer enters *disabled* mode: every method becomes a
-    no-op and a single "tracing disabled" log line is emitted at startup.
+    Args:
+        client: An explicit Langfuse client (mainly for tests). When provided,
+            tracing is enabled regardless of env credentials. When omitted, the
+            tracer initializes the global client via ``langfuse.get_client()``
+            only if credentials are configured.
+        enabled: Force-disable tracing by passing ``False`` (used by callers
+            that want to opt out). ``None`` means "auto-detect from env".
     """
 
     def __init__(
         self,
         *,
-        public_key: Optional[str] = None,
-        secret_key: Optional[str] = None,
-        host: Optional[str] = None,
         client: Any = None,
-        max_retries: int = DEFAULT_MAX_RETRIES,
+        enabled: Optional[bool] = None,
     ) -> None:
-        self.max_retries = max(1, int(max_retries))
-        self._current: Optional[StepHandle] = None
         self.client: Any = None
         self.enabled: bool = False
+        self._current: Optional[StepHandle] = None
 
-        # 1) An explicitly injected client (e.g. tests) always wins and means
-        #    "configured" — credentials are irrelevant in that case.
+        if enabled is False:
+            logger.info("Langfuse tracing disabled by caller; loop runs untraced.")
+            return
+
+        # An injected client (tests) wins and means "enabled".
         if client is not None:
             self.client = client
             self.enabled = True
             logger.info("Langfuse tracing enabled (injected client).")
             return
 
-        # 2) Otherwise resolve credentials from args, falling back to env vars.
-        public_key = public_key or os.environ.get("LANGFUSE_PUBLIC_KEY")
-        secret_key = secret_key or os.environ.get("LANGFUSE_SECRET_KEY")
-        host = host or os.environ.get("LANGFUSE_HOST")
-
-        if not (public_key and secret_key):
-            # Req 13.3 — unconfigured at startup: run untraced, log once.
-            logger.info("Langfuse not configured; tracing disabled. Loop will run untraced.")
+        if not _langfuse_configured():
+            # Requirement 13.3 — unconfigured at startup: run untraced, log once.
+            logger.info(
+                "Langfuse not configured (LANGFUSE_PUBLIC_KEY/SECRET_KEY missing); "
+                "tracing disabled. Loop will run untraced."
+            )
             return
 
-        # 3) Configured: try to build a real client. Any failure -> disabled.
         try:
-            from langfuse import Langfuse  # type: ignore
+            from langfuse import get_client  # imported after env is loaded
 
-            kwargs: dict[str, Any] = {"public_key": public_key, "secret_key": secret_key}
-            if host:
-                kwargs["host"] = host
-            self.client = Langfuse(**kwargs)
+            self.client = get_client()
+            # Best-effort connectivity check; never fatal.
+            try:
+                if not self.client.auth_check():
+                    logger.warning(
+                        "Langfuse auth_check failed; continuing (traces may be dropped)."
+                    )
+            except Exception:  # noqa: BLE001 - auth_check is best-effort
+                pass
             self.enabled = True
             logger.info("Langfuse tracing enabled.")
-        except Exception as exc:  # ImportError or constructor failure
+        except Exception as exc:  # noqa: BLE001 - import/init failure -> disabled
             logger.warning(
-                "Langfuse configured but client init failed (%s); tracing disabled.", exc
+                "Langfuse configured but client init failed (%s); tracing disabled.",
+                exc,
             )
             self.client = None
             self.enabled = False
 
-    # -- internal helpers ---------------------------------------------------
+    # -- trace attributes ----------------------------------------------------
 
-    def _with_retries(self, what: str, fn) -> Any:
-        """Run ``fn`` up to ``max_retries`` times, swallowing all errors.
+    @contextmanager
+    def propagate(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+    ) -> Iterator[None]:
+        """Attach trace attributes (session/user/tags) to enclosed observations.
 
-        Returns the function result on success, or ``None`` after the final
-        failure (Req 13.4 — never raise into the caller).
+        Wrap a run with this so all of its Ticks share a ``session_id`` (the run
+        id) and ``tags`` in the Langfuse UI. Safe no-op when disabled or when the
+        SDK lacks ``propagate_attributes``.
         """
-        last_exc: Optional[BaseException] = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                return fn()
-            except Exception as exc:  # noqa: BLE001 - we intentionally swallow
-                last_exc = exc
-                logger.debug("Tracing %s attempt %d/%d failed: %s", what, attempt, self.max_retries, exc)
-        logger.warning(
-            "Tracing %s failed after %d retries (%s); continuing step uninterrupted.",
-            what,
-            self.max_retries,
-            last_exc,
-        )
-        return None
+        if not self.enabled or self.client is None:
+            yield
+            return
+        try:
+            from langfuse import propagate_attributes
 
-    # -- public API ---------------------------------------------------------
+            kwargs: dict[str, Any] = {}
+            if session_id is not None:
+                kwargs["session_id"] = session_id
+            if user_id is not None:
+                kwargs["user_id"] = user_id
+            if tags is not None:
+                kwargs["tags"] = tags
+            with propagate_attributes(**kwargs):
+                yield
+        except Exception as exc:  # noqa: BLE001 - never break the caller
+            logger.debug("propagate_attributes unavailable/failed: %s", exc)
+            yield
+
+    # -- step spans ----------------------------------------------------------
 
     @contextmanager
     def trace_step(self, step_id: str, input: Any = None) -> Iterator[StepHandle]:
-        """Record a trace for a single agent step.
+        """Open a named span for one agent step (Requirement 13.1).
 
-        Captures start/end timestamps and the step input/output. Safe no-op
-        when disabled. Always yields a :class:`StepHandle` so callers can set
-        ``handle.output`` regardless of backend state.
+        Records the step id + input on entry and the output + duration on exit
+        via ``update_current_span``. OpenAI generations created inside the block
+        nest under this span automatically. Always yields a :class:`StepHandle`;
+        tracing errors degrade to a no-op without interrupting the step.
         """
         handle = StepHandle(step_id=step_id, input=input, start_time=time.time())
-
-        if self.enabled and self.client is not None:
-            handle.trace = self._with_retries(
-                "trace-start",
-                lambda: self.client.trace(name=step_id, input=input),
-            )
-
         previous = self._current
         self._current = handle
+
+        if not self.enabled or self.client is None:
+            try:
+                yield handle
+            finally:
+                handle.end_time = time.time()
+                self._current = previous
+            return
+
+        cm = None
+        try:
+            cm = self.client.start_as_current_observation(
+                as_type="span", name=step_id, input=input
+            )
+            span = cm.__enter__()
+            handle.span = span
+            handle.trace = span  # back-compat alias
+        except Exception as exc:  # noqa: BLE001 - tracing must not break the step
+            logger.warning("Tracing: failed to start span '%s' (%s); continuing.", step_id, exc)
+            cm = None
+
         try:
             yield handle
         finally:
             handle.end_time = time.time()
-            self._current = previous
-            if handle.trace is not None:
-                self._with_retries(
-                    "trace-end",
-                    lambda: handle.trace.update(
+            if cm is not None:
+                try:
+                    self.client.update_current_span(
                         output=handle.output,
-                        metadata={
-                            "step_id": handle.step_id,
-                            "start_time": handle.start_time,
-                            "end_time": handle.end_time,
-                            "duration_s": handle.end_time - handle.start_time,
-                        },
-                    ),
-                )
-                # Best-effort flush so the trace lands within ~2s (Req 13.1).
-                flush = getattr(self.client, "flush", None)
-                if callable(flush):
-                    self._with_retries("flush", flush)
+                        metadata={"duration_s": handle.end_time - handle.start_time},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Tracing: update_current_span failed: %s", exc)
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Tracing: span exit failed: %s", exc)
+            self._current = previous
 
     def record_llm_span(
         self,
@@ -186,41 +229,36 @@ class Tracer:
         response: Any,
         token_count: Optional[int] = None,
         *,
-        name: str = "truefoundry-call",
+        name: str = "llm-call",
     ) -> None:
-        """Record a TrueFoundry LLM call as a span linked to the current step.
+        """Record a manual LLM generation under the current step.
 
-        Safe no-op when disabled or when there is no active step trace.
+        With the OpenAI drop-in (:mod:`angent.observability.llm`) LLM calls are
+        already traced automatically, so this is only needed for non-OpenAI
+        calls. Safe no-op when disabled or when there is no active step.
         """
         if not self.enabled or self.client is None:
             return
-
-        trace = self._current.trace if self._current is not None else None
-        if trace is None:
-            # No active step trace to link to; skip silently (still no raise).
-            return
-
-        def _create_span() -> Any:
-            span = trace.span(
+        try:
+            with self.client.start_as_current_observation(
+                as_type="generation",
                 name=name,
                 input=prompt,
                 output=response,
-                metadata={"token_count": token_count},
-            )
-            end = getattr(span, "end", None)
-            if callable(end):
-                end()
-            return span
-
-        self._with_retries("llm-span", _create_span)
+                metadata={"token_count": token_count} if token_count is not None else None,
+            ):
+                pass
+        except Exception as exc:  # noqa: BLE001 - never break the caller
+            logger.debug("Tracing: record_llm_span failed: %s", exc)
 
     def flush(self) -> None:
-        """Flush any buffered events. Safe no-op when disabled."""
+        """Flush buffered events so a short-lived process ships its traces."""
         if not self.enabled or self.client is None:
             return
-        flush = getattr(self.client, "flush", None)
-        if callable(flush):
-            self._with_retries("flush", flush)
+        try:
+            self.client.flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Tracing: flush failed: %s", exc)
 
 
 def build_tracer(**kwargs: Any) -> Tracer:

@@ -10,7 +10,7 @@
 //     (Requirement 14), reusing the library.prompt() -> /api/chat -> <Renderer/>
 //     pipeline.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import LoopStatusDisplay from "../components/react-shell/LoopStatusDisplay";
 import QualifiedCompanyCard from "../components/react-shell/QualifiedCompanyCard";
@@ -72,8 +72,144 @@ const DRAFT = {
 
 type Tab = "dashboard" | "thesis";
 
+// --- ClickHouse signals (JSON string) -> a few readable chips ---------------
+function signalsToChips(raw: unknown): string[] {
+  if (!raw) return [];
+  let obj: Record<string, unknown> | null = null;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return raw ? [String(raw)] : [];
+    }
+  } else if (typeof raw === "object") {
+    obj = raw as Record<string, unknown>;
+  }
+  if (!obj) return [];
+  const label: Record<string, string> = {
+    points: "points",
+    num_comments: "comments",
+    stars: "stars",
+    commits: "commits",
+    forks: "forks",
+    downloads: "downloads",
+    likes: "likes",
+    language: "",
+    pipeline_tag: "",
+    kind: "",
+  };
+  const chips: string[] = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined || v === "") continue;
+    if (!(k in label)) continue;
+    chips.push(label[k] ? `${v} ${label[k]}` : String(v));
+    if (chips.length >= 4) break;
+  }
+  return chips;
+}
+
+interface ApiCompany {
+  source?: string;
+  name?: string;
+  url?: string;
+  fit_score?: number;
+  fit_explanation?: string;
+  signals?: unknown;
+}
+interface ApiLoopState {
+  tick_index?: number;
+  emails_sent?: number;
+  budget?: number;
+  reply_rate?: number;
+  status?: string;
+  stop_reason?: string | null;
+}
+interface ApiDraft {
+  subject?: string;
+  body?: string;
+  approved?: number;
+  sent?: number;
+}
+interface DashboardData {
+  source: string;
+  companies: ApiCompany[];
+  loopState: ApiLoopState | null;
+  draft: ApiDraft | null;
+}
+
 export default function Home() {
   const [tab, setTab] = useState<Tab>("dashboard");
+  const [data, setData] = useState<DashboardData | null>(null);
+  const [live, setLive] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/dashboard")
+      .then((r) => r.json())
+      .then((d: DashboardData & { ok: boolean }) => {
+        if (cancelled) return;
+        const hasReal = d.ok && Array.isArray(d.companies) && d.companies.length > 0;
+        setData(d);
+        setLive(hasReal);
+      })
+      .catch(() => {
+        /* keep demo fallback */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Real rows when the agent has populated ClickHouse; else representative data.
+  const companies =
+    live && data
+      ? data.companies.map((c) => ({
+          name: c.name || "(unnamed)",
+          url: c.url || "#",
+          source:
+            c.source === "github"
+              ? "GitHub"
+              : c.source === "hackernews"
+              ? "Hacker News"
+              : c.source === "huggingface"
+              ? "Hugging Face"
+              : c.source || "source",
+          fitScore: Number(c.fit_score ?? 0),
+          fitExplanation:
+            c.fit_explanation && c.fit_explanation !== ""
+              ? c.fit_explanation
+              : "Scored by the heuristic scorer; explanation pending the LLM gateway.",
+          signals: signalsToChips(c.signals),
+        }))
+      : COMPANIES;
+
+  const loop =
+    live && data && data.loopState
+      ? {
+          tickIndex: Number(data.loopState.tick_index ?? 0),
+          emailsSent: Number(data.loopState.emails_sent ?? 0),
+          budget: Number(data.loopState.budget ?? 8),
+          replyRate: Number(data.loopState.reply_rate ?? 0),
+          status: (data.loopState.status === "stopped" ? "stopped" : "running") as
+            | "running"
+            | "stopped",
+          stopReason: (data.loopState.stop_reason || null) as
+            | "goal-met"
+            | "deadline-reached"
+            | "email-budget-exhausted"
+            | null,
+        }
+      : { tickIndex: 4, emailsSent: 3, budget: 8, replyRate: 0.18, status: "running" as const, stopReason: null };
+
+  const draft =
+    live && data && data.draft
+      ? {
+          subject: data.draft.subject || "(no subject)",
+          body: data.draft.body || "",
+          approved: Number(data.draft.approved ?? 0) === 1,
+          sent: Number(data.draft.sent ?? 0) === 1,
+        }
+      : DRAFT;
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-gray-50">
@@ -85,27 +221,39 @@ export default function Home() {
             self-improving deal sourcing
           </span>
         </div>
-        <nav className="flex gap-1 rounded-lg bg-gray-100 p-1 text-sm">
-          <button
-            onClick={() => setTab("dashboard")}
-            className={`rounded-md px-3 py-1.5 font-medium transition ${
-              tab === "dashboard"
-                ? "bg-white text-gray-900 shadow-sm"
-                : "text-gray-500 hover:text-gray-800"
+        <nav className="flex items-center gap-3">
+          <span
+            className={`hidden rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ring-inset sm:inline ${
+              live
+                ? "bg-emerald-100 text-emerald-800 ring-emerald-600/20"
+                : "bg-amber-100 text-amber-800 ring-amber-600/20"
             }`}
+            title={live ? "Reading live rows from ClickHouse" : "Showing representative data (run the agent to populate ClickHouse)"}
           >
-            Dashboard
-          </button>
-          <button
-            onClick={() => setTab("thesis")}
-            className={`rounded-md px-3 py-1.5 font-medium transition ${
-              tab === "thesis"
-                ? "bg-white text-gray-900 shadow-sm"
-                : "text-gray-500 hover:text-gray-800"
-            }`}
-          >
-            Thesis Chat (OpenUI)
-          </button>
+            {live ? "● live · ClickHouse" : "○ demo data"}
+          </span>
+          <div className="flex gap-1 rounded-lg bg-gray-100 p-1 text-sm">
+            <button
+              onClick={() => setTab("dashboard")}
+              className={`rounded-md px-3 py-1.5 font-medium transition ${
+                tab === "dashboard"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-gray-500 hover:text-gray-800"
+              }`}
+            >
+              Dashboard
+            </button>
+            <button
+              onClick={() => setTab("thesis")}
+              className={`rounded-md px-3 py-1.5 font-medium transition ${
+                tab === "thesis"
+                  ? "bg-white text-gray-900 shadow-sm"
+                  : "text-gray-500 hover:text-gray-800"
+              }`}
+            >
+              Thesis Chat (OpenUI)
+            </button>
+          </div>
         </nav>
       </header>
 
@@ -119,12 +267,12 @@ export default function Home() {
             </div>
 
             <LoopStatusDisplay
-              tickIndex={4}
-              emailsSent={3}
-              budget={8}
-              replyRate={0.18}
-              status="running"
-              stopReason={null}
+              tickIndex={loop.tickIndex}
+              emailsSent={loop.emailsSent}
+              budget={loop.budget}
+              replyRate={loop.replyRate}
+              status={loop.status}
+              stopReason={loop.stopReason}
             />
 
             <section className="flex flex-col gap-3">
@@ -132,7 +280,7 @@ export default function Home() {
                 Qualified companies
               </h2>
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-                {COMPANIES.map((c) => (
+                {companies.map((c) => (
                   <QualifiedCompanyCard key={c.url} {...c} />
                 ))}
               </div>
@@ -142,7 +290,7 @@ export default function Home() {
               <h2 className="text-sm font-semibold text-gray-900">
                 Drafted email (awaiting send)
               </h2>
-              <DraftedEmailPreview {...DRAFT} />
+              <DraftedEmailPreview {...draft} />
             </section>
           </div>
         ) : (

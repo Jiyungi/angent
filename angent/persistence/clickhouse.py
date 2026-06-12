@@ -27,9 +27,11 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional, Sequence
 
 from ..config import Config, load_config
+from ..models import Goal, LoopState, StopReason
 
 logger = logging.getLogger("angent.persistence.clickhouse")
 
@@ -409,6 +411,149 @@ class ClickHouseClient:
     # Alias matching the task wording ("create_tables").
     def create_tables(self, *, raise_on_failure: bool = False) -> dict[str, RetryResult]:
         return self.create_schema(raise_on_failure=raise_on_failure)
+
+    # -- loop_state read/write (latest-version-wins) -------------------------
+
+    # Column order matches the ``loop_state`` table DDL above and is reused for
+    # both insert (write) and select (read) so the two stay in lock-step.
+    LOOP_STATE_COLUMNS: tuple[str, ...] = (
+        "run_id",
+        "tick_index",
+        "goal_target",
+        "goal_deadline",
+        "goal_email_budget",
+        "emails_sent",
+        "reply_rate",
+        "thesis_breadth",
+        "email_angle",
+        "send_volume",
+        "status",
+        "stop_reason",
+        "started_at",
+        "updated_at",
+        "version",
+    )
+
+    def _next_loop_state_version(self, run_id: str) -> int:
+        """Return ``max(version) + 1`` for ``run_id`` (1 if no rows yet).
+
+        On a read failure we fall back to a time-based version so the new write
+        still sorts after older rows on the ``ReplacingMergeTree`` and is never
+        silently dropped.
+        """
+        result = self.query(
+            "SELECT max(version) FROM loop_state WHERE run_id = {run_id:String}",
+            parameters={"run_id": run_id},
+        )
+        if result.ok and result.rows:
+            current = result.rows[0][0]
+            if current is not None:
+                return int(current) + 1
+            return 1
+        # Read failed entirely — use a monotonic-ish fallback so latest still wins.
+        logger.warning(
+            "Could not read current loop_state version for run_id=%s; "
+            "falling back to time-based version",
+            run_id,
+        )
+        return int(time.time())
+
+    def write_loop_state(
+        self, state: LoopState, *, raise_on_failure: bool = False
+    ) -> RetryResult:
+        """Persist ``state`` to ``loop_state`` with an incremented ``version``.
+
+        The new row carries ``max(version)+1`` for the run and ``updated_at =
+        now`` so the ``ReplacingMergeTree(version)`` keeps this row as the
+        winner — any subsequent :meth:`read_loop_state` (by this or another
+        agent) returns the just-written state (Requirements 12.3, 22).
+        """
+        version = self._next_loop_state_version(state.run_id)
+        updated_at = datetime.now()
+        stop_reason = state.stop_reason.value if state.stop_reason is not None else None
+
+        row = [
+            state.run_id,
+            int(state.tick_index),
+            float(state.goal.target_metric),
+            state.goal.deadline,
+            int(state.goal.email_budget),
+            int(state.emails_sent),
+            float(state.reply_rate),
+            float(state.thesis_breadth),
+            state.email_angle,
+            int(state.send_volume),
+            str(state.status),
+            stop_reason,
+            state.started_at,
+            updated_at,
+            version,
+        ]
+
+        return self.insert(
+            "loop_state",
+            [row],
+            list(self.LOOP_STATE_COLUMNS),
+            raise_on_failure=raise_on_failure,
+        )
+
+    def read_loop_state(
+        self, run_id: str, *, raise_on_failure: bool = False
+    ) -> Optional[LoopState]:
+        """Return the most recent :class:`LoopState` for ``run_id`` or ``None``.
+
+        Selects the highest ``version`` row (``ORDER BY version DESC LIMIT 1``),
+        which on the ``ReplacingMergeTree`` is the latest-written state, and
+        reconstructs the :class:`LoopState` (nested :class:`Goal` and the
+        :class:`StopReason` enum). Returns ``None`` when the run has no rows.
+        """
+        columns = ", ".join(self.LOOP_STATE_COLUMNS)
+        result = self.query(
+            f"SELECT {columns} FROM loop_state "
+            "WHERE run_id = {run_id:String} "
+            "ORDER BY version DESC LIMIT 1",
+            parameters={"run_id": run_id},
+            raise_on_failure=raise_on_failure,
+        )
+        if not result.ok or not result.rows:
+            return None
+
+        (
+            r_run_id,
+            tick_index,
+            goal_target,
+            goal_deadline,
+            goal_email_budget,
+            emails_sent,
+            reply_rate,
+            thesis_breadth,
+            email_angle,
+            send_volume,
+            status,
+            stop_reason,
+            started_at,
+            _updated_at,
+            _version,
+        ) = result.rows[0]
+
+        goal = Goal(
+            target_metric=float(goal_target),
+            deadline=goal_deadline,
+            email_budget=int(goal_email_budget),
+        )
+        return LoopState(
+            run_id=r_run_id,
+            goal=goal,
+            started_at=started_at,
+            tick_index=int(tick_index),
+            emails_sent=int(emails_sent),
+            reply_rate=float(reply_rate),
+            thesis_breadth=float(thesis_breadth),
+            email_angle=email_angle,
+            send_volume=int(send_volume),
+            status=status,
+            stop_reason=StopReason(stop_reason) if stop_reason else None,
+        )
 
     def __enter__(self) -> "ClickHouseClient":
         self.connect()

@@ -25,51 +25,6 @@ const DEMO_THESIS =
   "frameworks, LLM agent tooling, data/ML platforms, and API-first products " +
   "that help engineers ship faster.";
 
-const COMPANIES = [
-  {
-    name: "vectorforge",
-    url: "https://github.com/vectorforge/vectorforge",
-    source: "GitHub",
-    fitScore: 91,
-    fitExplanation:
-      "High-velocity open-source vector database with strong early stargazer " +
-      "growth — squarely matches the AI-infrastructure thesis.",
-    signals: ["1.8k stars", "312 commits/90d", "OSS"],
-  },
-  {
-    name: "Show HN: Orchestra — typed LLM agent runtime",
-    url: "https://news.ycombinator.com/item?id=48509968",
-    source: "Hacker News",
-    fitScore: 84,
-    fitExplanation:
-      "Launch HN for a typed agent-orchestration runtime; developer-first and " +
-      "API-driven, aligned with the LLM agent-tooling part of the thesis.",
-    signals: ["247 points", "96 comments", "Launch HN"],
-  },
-  {
-    name: "lakehouse-rs",
-    url: "https://github.com/lakehouse-rs/lakehouse",
-    source: "GitHub",
-    fitScore: 76,
-    fitExplanation:
-      "Rust data-lake engine targeting ML feature pipelines — fits the data/ML " +
-      "platform angle, though earlier-stage traction than the top pick.",
-    signals: ["640 stars", "Rust", "data/ML"],
-  },
-];
-
-const DRAFT = {
-  subject: "Congrats on the vectorforge launch — quick question on traction",
-  body:
-    "Hi there,\n\nI saw vectorforge cross 1.8k stars in under three months — " +
-    "impressive velocity for an open-source vector DB. I invest in early-stage " +
-    "AI-infrastructure and dev-tools companies and would love to hear how you're " +
-    "thinking about the commercial layer.\n\nWould you be open to a short call " +
-    "next week?\n\nBest,\nAngent (on behalf of the investor)",
-  approved: true,
-  sent: false,
-};
-
 type Tab = "dashboard" | "thesis";
 
 // --- ClickHouse signals (JSON string) -> a few readable chips ---------------
@@ -184,31 +139,30 @@ export default function Home() {
     }, 2000);
   }, [loadData]);
 
-  // Real rows when the agent has populated ClickHouse; else representative data.
-  const companies =
-    live && data
-      ? data.companies.map((c) => ({
-          name: c.name || "(unnamed)",
-          url: c.url || "#",
-          source:
-            c.source === "github"
-              ? "GitHub"
-              : c.source === "hackernews"
-              ? "Hacker News"
-              : c.source === "huggingface"
-              ? "Hugging Face"
-              : c.source || "source",
-          fitScore: Number(c.fit_score ?? 0),
-          fitExplanation:
-            c.fit_explanation && c.fit_explanation !== ""
-              ? c.fit_explanation
-              : "Scored by the heuristic scorer; explanation pending the LLM gateway.",
-          signals: signalsToChips(c.signals),
-        }))
-      : COMPANIES;
+  // Only real rows from ClickHouse — no mock fallback.
+  const companies = data
+    ? data.companies.map((c) => ({
+        name: c.name || "(unnamed)",
+        url: c.url || "#",
+        source:
+          c.source === "github"
+            ? "GitHub"
+            : c.source === "hackernews"
+            ? "Hacker News"
+            : c.source === "huggingface"
+            ? "Hugging Face"
+            : c.source || "source",
+        fitScore: Number(c.fit_score ?? 0),
+        fitExplanation:
+          c.fit_explanation && c.fit_explanation !== ""
+            ? c.fit_explanation
+            : "Scored by the heuristic scorer; explanation pending the LLM gateway.",
+        signals: signalsToChips(c.signals),
+      }))
+    : [];
 
   const loop =
-    live && data && data.loopState
+    data && data.loopState
       ? {
           tickIndex: Number(data.loopState.tick_index ?? 0),
           emailsSent: Number(data.loopState.emails_sent ?? 0),
@@ -223,17 +177,17 @@ export default function Home() {
             | "email-budget-exhausted"
             | null,
         }
-      : { tickIndex: 4, emailsSent: 3, budget: 8, replyRate: 0.18, status: "running" as const, stopReason: null };
+      : null;
 
   const draft =
-    live && data && data.draft
+    data && data.draft
       ? {
           subject: data.draft.subject || "(no subject)",
           body: data.draft.body || "",
           approved: Number(data.draft.approved ?? 0) === 1,
           sent: Number(data.draft.sent ?? 0) === 1,
         }
-      : DRAFT;
+      : null;
 
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-linear-to-b from-slate-50 to-slate-100 text-slate-900">
@@ -255,12 +209,12 @@ export default function Home() {
             className={`hidden items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ring-inset sm:inline-flex ${
               live
                 ? "bg-emerald-50 text-emerald-700 ring-emerald-600/20"
-                : "bg-amber-50 text-amber-700 ring-amber-600/20"
+                : "bg-slate-100 text-slate-500 ring-slate-400/20"
             }`}
-            title={live ? "Reading live rows from ClickHouse" : "Showing representative data"}
+            title={live ? "Reading live rows from ClickHouse" : "Awaiting a run — no data loaded yet"}
           >
-            <span className={`h-1.5 w-1.5 rounded-full ${live ? "bg-emerald-500" : "bg-amber-500"}`} />
-            {live ? "live · ClickHouse" : "demo data"}
+            <span className={`h-1.5 w-1.5 rounded-full ${live ? "bg-emerald-500" : "bg-slate-400"}`} />
+            {live ? "live · ClickHouse" : "awaiting run"}
           </span>
           <div className="flex gap-1 rounded-xl bg-slate-100 p-1 text-sm">
             <button
@@ -331,14 +285,16 @@ export default function Home() {
               </div>
             </div>
 
-            <LoopStatusDisplay
-              tickIndex={loop.tickIndex}
-              emailsSent={loop.emailsSent}
-              budget={loop.budget}
-              replyRate={loop.replyRate}
-              status={loop.status}
-              stopReason={loop.stopReason}
-            />
+            {loop && (
+              <LoopStatusDisplay
+                tickIndex={loop.tickIndex}
+                emailsSent={loop.emailsSent}
+                budget={loop.budget}
+                replyRate={loop.replyRate}
+                status={loop.status}
+                stopReason={loop.stopReason}
+              />
+            )}
 
             <section className="flex flex-col gap-3">
               <div className="flex items-center gap-2">
@@ -349,19 +305,34 @@ export default function Home() {
                   {companies.length}
                 </span>
               </div>
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-                {companies.map((c) => (
-                  <QualifiedCompanyCard key={c.url} {...c} />
-                ))}
-              </div>
+              {companies.length > 0 ? (
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
+                  {companies.map((c) => (
+                    <QualifiedCompanyCard key={c.url} {...c} />
+                  ))}
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-slate-300 bg-white/60 p-10 text-center">
+                  <p className="text-sm font-medium text-slate-600">
+                    {running ? "Sourcing and scoring startups…" : "No deals yet"}
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    {running
+                      ? "Results will appear here as the agent qualifies companies."
+                      : "Set your thesis above and click Run Agent to source live deals."}
+                  </p>
+                </div>
+              )}
             </section>
 
-            <section className="flex flex-col gap-3">
-              <h2 className="text-base font-bold tracking-tight text-slate-900">
-                Drafted outreach <span className="font-normal text-slate-400">· awaiting your approval</span>
-              </h2>
-              <DraftedEmailPreview {...draft} />
-            </section>
+            {draft && (
+              <section className="flex flex-col gap-3">
+                <h2 className="text-base font-bold tracking-tight text-slate-900">
+                  Drafted outreach <span className="font-normal text-slate-400">· awaiting your approval</span>
+                </h2>
+                <DraftedEmailPreview {...draft} />
+              </section>
+            )}
 
             <div className="pb-2 text-center text-xs text-slate-400">
               Powered by ClickHouse · TrueFoundry · Langfuse · Airbyte · x402

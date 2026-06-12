@@ -1,0 +1,12 @@
+{
+  "$comment": "Impeccable polish-pass scope (Requirements 15.2-15.5). The polish pass touches ONLY the plain React_Shell components and NEVER the OpenUI-generated surfaces. Authoritative classification: src/components/component-classification.ts. The `npm run impeccable` script runs `impeccable detect` against `include`; `.impeccableignore` double-locks `exclude`.",
+  "include": [
+    "src/components/react-shell/**"
+  ],
+  "exclude": [
+    "src/components/openui/**",
+    ".next/**",
+    "node_modules/**"
+  ],
+  "ignoreFile": ".impeccableignore"
+}

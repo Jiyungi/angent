@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "impeccable": "impeccable detect src/components/react-shell",
+    "impeccable:json": "impeccable detect --json src/components/react-shell"
   },
   "dependencies": {
     "@openuidev/react-ui": "latest",

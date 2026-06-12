@@ -1,0 +1,21 @@
+# Impeccable polish-pass exclusions (Requirement 15.4, 15.5).
+#
+# Paths listed here are OpenUI-GENERATED surfaces (rendered at runtime via
+# OpenUI Lang + <Renderer/>). The Impeccable polish pass must NEVER add,
+# remove, restyle, or otherwise alter these or their markup. If a pass
+# encounters one it must leave it unchanged and continue with the remaining
+# plain React_Shell components.
+#
+# The authoritative classification lives in:
+#   src/components/component-classification.ts
+#
+# The `npm run impeccable` script scopes `impeccable detect` to the React_Shell
+# only (src/components/react-shell), so these are never visited in practice;
+# this file documents and double-locks the exclusion.
+
+# OpenUI-generated surfaces — off-limits to Impeccable
+src/components/openui/
+
+# Build + dependency artifacts (not polish targets)
+.next/
+node_modules/

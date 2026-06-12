@@ -30,7 +30,7 @@ from typing import Any, Callable, Optional
 
 from ..models import Goal, LoopState, StopReason, TickOutcome
 from ..persistence.clickhouse import ClickHouseClient
-from .validation import validate_goal
+from .validation import _as_naive, validate_goal
 
 logger = logging.getLogger("angent.loop.control_loop")
 
@@ -244,12 +244,58 @@ class ControlLoop:
     def evaluate_termination(
         self, state: LoopState, now: datetime
     ) -> Optional[StopReason]:
-        """Return the highest-priority stop reason, or None to continue.
+        """Return the single highest-priority stop reason, or None to continue.
 
-        Implemented in task 13.1 (Requirement 3). Declared here so wiring and
-        imports remain stable.
+        Pure function (no I/O): given the current ``state`` and a clock reading
+        ``now``, decide whether the run should stop and, if so, *why*. The three
+        terminal conditions are checked in strict priority order and the first
+        match wins, so at most one :class:`StopReason` is ever returned
+        (Requirements 3.1-3.4, 3.6):
+
+          1. **goal-met** — the achieved metric has reached the target. We use
+             ``state.reply_rate`` as the achieved measure of
+             ``state.goal.target_metric`` (the loop's optimization signal): if
+             ``state.reply_rate >= state.goal.target_metric`` return
+             :attr:`StopReason.GOAL_MET` (Requirement 3.1).
+          2. **deadline-reached** — ``now >= state.goal.deadline`` returns
+             :attr:`StopReason.DEADLINE_REACHED` (Requirement 3.2).
+          3. **email-budget-exhausted** — ``state.emails_sent >=
+             state.goal.email_budget`` returns
+             :attr:`StopReason.EMAIL_BUDGET_EXHAUSTED` (Requirement 3.3).
+
+        When none match, return ``None`` to continue the loop (Requirement 3.4).
+        Because the checks are ordered, if several conditions hold at once the
+        highest-priority reason is reported (e.g. goal-met outranks both
+        deadline-reached and email-budget-exhausted) (Requirement 3.6).
+
+        Datetime handling: the deadline comparison coerces both ``now`` and
+        ``state.goal.deadline`` to naive wall-clock time before comparing,
+        matching the convention in :mod:`angent.loop.validation` (the core
+        stores naive ``DateTime`` values). This keeps the comparison safe when a
+        caller supplies a timezone-aware ``now`` while the stored deadline is
+        naive (or vice versa).
+
+        Args:
+            state: The current :class:`LoopState` for the run.
+            now: The current time (naive or timezone-aware).
+
+        Returns:
+            The highest-priority :class:`StopReason`, or ``None`` to continue.
         """
-        raise NotImplementedError("evaluate_termination is implemented in task 13.1")
+        # 1. goal-met (highest priority): achieved reply_rate vs target_metric.
+        if state.reply_rate >= state.goal.target_metric:
+            return StopReason.GOAL_MET
+
+        # 2. deadline-reached: compare on a consistent (naive) basis.
+        if _as_naive(now) >= _as_naive(state.goal.deadline):
+            return StopReason.DEADLINE_REACHED
+
+        # 3. email-budget-exhausted (lowest priority).
+        if state.emails_sent >= state.goal.email_budget:
+            return StopReason.EMAIL_BUDGET_EXHAUSTED
+
+        # No terminal condition met — continue the loop.
+        return None
 
     def run_tick(self, state: LoopState) -> TickOutcome:
         """Run a single Tick of the pipeline and return its outcome.

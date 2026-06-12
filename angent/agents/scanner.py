@@ -280,3 +280,333 @@ class HackerNewsSource:
         if isinstance(value, (int, float)):
             return max(0, int(value))
         return 0
+
+
+# --- GitHub (Airbyte Agents API) source ------------------------------------
+
+# Confirmed two-step Airbyte OAuth client-credentials flow (folded in from the
+# now-removed probe scripts ``test_airbyte.py`` / ``check_connectors.py`` — see
+# the design doc's Research Notes):
+#
+#   1. POST https://api.airbyte.com/v1/applications/token
+#        json={client_id, client_secret, grant_type="client_credentials"}
+#        -> JSON body carries the bearer token under ``access_token``.
+#   2. Call the Agents API at
+#        https://api.airbyte.ai/api/v1/integrations/connectors
+#        with ``Authorization: Bearer <token>`` PLUS ``X-Organization-Id``.
+#
+# The connectors endpoint confirmed-returns the *catalog of available connector
+# definitions* (GitHub is present as ``connector_name="github"``); the exact
+# shape of an actual GitHub repo/stargazer/commit *records* response from the
+# Agents API is uncertain for this tier. We therefore treat GitHub discovery as
+# a best-effort integration: do the token exchange, call the connectors /
+# discovery endpoint, defensively parse any repo-like records out of whatever
+# JSON comes back, and degrade gracefully (return an empty list) when no usable
+# repo data is available or credentials/tier are missing. The Scanner (task 5.4)
+# tolerates a per-source empty/failed result, so an unavailable GitHub tier
+# never crashes a Tick.
+
+# Step 1 — OAuth client-credentials token endpoint (api.airbyte.com).
+_AIRBYTE_TOKEN_URL = "https://api.airbyte.com/v1/applications/token"
+
+# Step 2 — Agents API connectors / discovery endpoint (api.airbyte.ai).
+_AIRBYTE_CONNECTORS_URL = "https://api.airbyte.ai/api/v1/integrations/connectors"
+
+# Per-source request budget (Requirement 4.1): each request completes within 30s.
+_GH_TIMEOUT_SECONDS = 30
+
+# Hard 90-day recency window (Requirement 4.1).
+_GH_WINDOW_DAYS = 90
+
+# Keys we probe, in order, when extracting repo-like record arrays from an
+# uncertain Agents-API response shape.
+_GH_RECORD_CONTAINER_KEYS = (
+    "repositories",
+    "repos",
+    "records",
+    "results",
+    "items",
+    "data",
+)
+
+# Per-record field aliases for defensive parsing across possible shapes.
+_GH_NAME_KEYS = ("full_name", "name", "repo", "repository", "title")
+_GH_URL_KEYS = ("html_url", "url", "clone_url", "git_url", "link")
+_GH_ID_KEYS = ("id", "node_id", "full_name", "name")
+_GH_STARS_KEYS = ("stargazers_count", "stars", "stargazers", "star_count", "watchers_count")
+_GH_COMMITS_KEYS = ("commits", "commit_count", "total_commits", "commits_count")
+_GH_FORKS_KEYS = ("forks_count", "forks", "fork_count")
+_GH_ACTIVITY_KEYS = ("pushed_at", "updated_at", "created_at", "last_activity_at")
+
+
+class GitHubSource:
+    """GitHub signal source via the Airbyte Agents API (Requirement 4.1).
+
+    Implements :class:`SignalSource`. Uses the confirmed two-step OAuth
+    client-credentials flow to obtain a bearer token, then calls the Agents API
+    connectors / discovery endpoint with ``Authorization: Bearer`` plus
+    ``X-Organization-Id``. Any repo-like records returned are mapped to a
+    :class:`~angent.models.Candidate`:
+
+    * ``source`` = ``"github"``
+    * ``source_unique_id`` = the repo ``full_name`` (or numeric ``id`` fallback)
+    * ``name`` = the repo name
+    * ``url`` = the repo ``html_url``
+    * ``signals`` = ``{"stars": ..., "commits": ..., "forks": ..., ...}``
+    * ``first_activity`` = the repo's most recent activity timestamp, required to
+      fall within the last 90 days.
+
+    Best-effort + graceful degradation: missing Airbyte credentials, a failed
+    token exchange, a non-2xx/invalid connectors response, or a response with no
+    usable repo records all yield an empty list rather than raising. The HTTP
+    session and config are injectable for testing.
+    """
+
+    name = "github"
+
+    def __init__(
+        self,
+        config: Optional["object"] = None,
+        session: Optional[requests.Session] = None,
+        timeout: int = _GH_TIMEOUT_SECONDS,
+    ) -> None:
+        # Lazy import keeps this module importable even if config wiring changes.
+        if config is None:
+            from angent.config import load_config
+
+            config = load_config()
+        self._config = config
+        self._airbyte = getattr(config, "airbyte", None)
+        self._session = session or requests.Session()
+        self._timeout = timeout
+
+    # -- public SignalSource interface --------------------------------------
+
+    def fetch(self, plan: TickPlan, since: datetime) -> list[Candidate]:
+        """Fetch GitHub repo candidates with activity in the last 90 days.
+
+        Returns an empty list (never raises) when Airbyte credentials are
+        absent, the token exchange fails, the Agents API is unreachable, or the
+        response carries no usable repo records — so the Scanner can continue
+        with the remaining sources and still complete the Tick.
+        """
+        if self._airbyte is None or not getattr(self._airbyte, "is_configured", False):
+            # No Airbyte client_id/secret configured: degrade gracefully.
+            return []
+
+        token = self._get_token()
+        if not token:
+            return []
+
+        records = self._discover_repos(token)
+        if not records:
+            return []
+
+        floor = self._window_floor(since)
+        candidates: dict[str, Candidate] = {}
+        for record in records:
+            candidate = self._to_candidate(record, floor=floor)
+            if candidate is not None:
+                candidates.setdefault(candidate.source_unique_id, candidate)
+        return list(candidates.values())
+
+    # -- step 1: OAuth client-credentials token -----------------------------
+
+    def _get_token(self) -> Optional[str]:
+        """Exchange client_id/client_secret for a bearer ``access_token``.
+
+        POSTs to the Airbyte token endpoint with ``grant_type=client_credentials``
+        exactly as the confirmed probe scripts did. Any timeout/transport/parse
+        error or a missing token returns ``None`` so callers degrade gracefully.
+        """
+        try:
+            response = self._session.post(
+                _AIRBYTE_TOKEN_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json={
+                    "client_id": self._airbyte.client_id,
+                    "client_secret": self._airbyte.client_secret,
+                    "grant_type": "client_credentials",
+                },
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+        token = payload.get("access_token")
+        return token if isinstance(token, str) and token else None
+
+    # -- step 2: Agents API connectors / discovery --------------------------
+
+    def _discover_repos(self, token: str) -> list[dict]:
+        """Call the Agents API connectors/discovery endpoint and extract repos.
+
+        Sends ``Authorization: Bearer`` plus the required ``X-Organization-Id``
+        header (the confirmed Agents-API contract). Because the exact records
+        shape is uncertain for this tier, the JSON is handed to a defensive
+        extractor that pulls repo-like dicts out of whatever container key is
+        present. Any failure returns an empty list.
+        """
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        org_id = getattr(self._airbyte, "organization_id", None)
+        if org_id:
+            headers["X-Organization-Id"] = org_id
+
+        try:
+            response = self._session.get(
+                _AIRBYTE_CONNECTORS_URL,
+                params={"workspace_name": "default"},
+                headers=headers,
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError):
+            return []
+
+        return self._extract_repo_records(payload)
+
+    @staticmethod
+    def _extract_repo_records(payload: object) -> list[dict]:
+        """Defensively pull repo-like records out of an uncertain response shape.
+
+        Walks the known container keys (``repositories``/``records``/``data``/…)
+        and keeps only dict entries that look like a repository (carry a
+        name-ish field AND either a URL-ish or a stars-ish field). The connector
+        *catalog* entries returned by the confirmed connectors endpoint lack
+        these repo signals, so they are filtered out and discovery degrades to an
+        empty list rather than misclassifying a connector definition as a repo.
+        """
+        if not isinstance(payload, dict):
+            return []
+
+        for key in _GH_RECORD_CONTAINER_KEYS:
+            container = payload.get(key)
+            if isinstance(container, list):
+                repos = [
+                    item
+                    for item in container
+                    if isinstance(item, dict) and GitHubSource._looks_like_repo(item)
+                ]
+                if repos:
+                    return repos
+        return []
+
+    @staticmethod
+    def _looks_like_repo(record: dict) -> bool:
+        """Heuristic: a record is a repo if it has a name AND a URL or star count."""
+        has_name = any(record.get(k) for k in _GH_NAME_KEYS)
+        has_url = any(record.get(k) for k in _GH_URL_KEYS)
+        has_stars = any(k in record for k in _GH_STARS_KEYS)
+        return bool(has_name and (has_url or has_stars))
+
+    # -- mapping + window helpers -------------------------------------------
+
+    def _window_floor(self, since: datetime) -> datetime:
+        """Return the effective lower time bound: max(since, now - 90 days)."""
+        now = datetime.now(timezone.utc)
+        ninety_days_ago = now - timedelta(days=_GH_WINDOW_DAYS)
+        bound = since
+        if bound.tzinfo is None:
+            bound = bound.replace(tzinfo=timezone.utc)
+        else:
+            bound = bound.astimezone(timezone.utc)
+        return max(bound, ninety_days_ago)
+
+    def _to_candidate(self, record: dict, *, floor: datetime) -> Optional[Candidate]:
+        """Map one repo-like record to a Candidate, or None to skip it.
+
+        Skips records without a name, and records whose most recent activity
+        falls before the 90-day floor (Requirement 4.1). Stars/commits/forks are
+        coerced to non-negative ints for the ``signals`` payload.
+        """
+        if not isinstance(record, dict):
+            return None
+
+        name = self._first_str(record, _GH_NAME_KEYS)
+        if not name:
+            return None
+
+        first_activity = self._parse_activity(record)
+        if first_activity is not None and first_activity < floor:
+            return None
+
+        unique_id = self._first_str(record, _GH_ID_KEYS) or name
+        url = self._first_str(record, _GH_URL_KEYS) or f"https://github.com/{name}"
+
+        return Candidate(
+            source=GitHubSource.name,
+            source_unique_id=str(unique_id),
+            name=str(name),
+            url=url,
+            signals={
+                "stars": self._first_int(record, _GH_STARS_KEYS),
+                "commits": self._first_int(record, _GH_COMMITS_KEYS),
+                "forks": self._first_int(record, _GH_FORKS_KEYS),
+                "language": record.get("language"),
+                "description": record.get("description"),
+            },
+            first_activity=first_activity,
+        )
+
+    @staticmethod
+    def _first_str(record: dict, keys: tuple[str, ...]) -> Optional[str]:
+        """Return the first non-empty string value among ``keys``."""
+        for key in keys:
+            value = record.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return str(value)
+        return None
+
+    @staticmethod
+    def _first_int(record: dict, keys: tuple[str, ...]) -> int:
+        """Return the first coercible non-negative int among ``keys`` (0 default)."""
+        for key in keys:
+            value = record.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                return max(0, int(value))
+            if isinstance(value, str) and value.strip().isdigit():
+                return max(0, int(value.strip()))
+        return 0
+
+    @staticmethod
+    def _parse_activity(record: dict) -> Optional[datetime]:
+        """Extract the repo's most recent activity as a tz-aware UTC datetime.
+
+        Probes ``pushed_at``/``updated_at``/``created_at`` (ISO8601, possibly
+        ``Z``-suffixed) and unix-second numbers, returning ``None`` when none is
+        parseable so the record is kept (the floor check then no-ops defensively).
+        """
+        for key in _GH_ACTIVITY_KEYS:
+            value = record.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                try:
+                    return datetime.fromtimestamp(int(value), tz=timezone.utc)
+                except (OverflowError, OSError, ValueError):
+                    continue
+            if isinstance(value, str) and value.strip():
+                try:
+                    normalized = value.strip().replace("Z", "+00:00")
+                    parsed = datetime.fromisoformat(normalized)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    return parsed.astimezone(timezone.utc)
+                except ValueError:
+                    continue
+        return None

@@ -164,102 +164,102 @@ This plan builds the Angent self-improving deal-sourcing agent incrementally as 
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 6.7, 6.8, 12.4, 22_
 
-- [-] 12. Run-and-commit checkpoint (after the Optimizer group)
+- [x] 12. Run-and-commit checkpoint (after the Optimizer group)
   - Run the partial Control_Loop built so far (scanner → qualifier → writer → sender → optimizer, with the Governance_Gate enforced on every send) end to end against the demo config and confirm the expected backend-log/console output: drafts created unsent/unapproved, an approved draft sent to the controlled inbox, outcomes stored, and the reply-rate metric updating per Tick
   - Confirm all changes so far are committed and pushed to `main` at https://github.com/Jiyungi/angent
   - _Requirements: 23.5, 22.3, 22.4_
 
-- [ ] 13. Implement the Planner and Control Loop
-  - [ ] 13.1 Implement `evaluate_termination` as a pure function
+- [x] 13. Implement the Planner and Control Loop
+  - [x] 13.1 Implement `evaluate_termination` as a pure function
     - Implement `evaluate_termination(state, now) -> Optional[StopReason]` returning `None` to continue, otherwise the single highest-priority `StopReason` in order goal-met > deadline-reached > email-budget-exhausted
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.6, 2.2, 22_
 
-  - [ ] 13.3 Implement the Planner `plan`/`reflect` with stall adaptation
+  - [x] 13.3 Implement the Planner `plan`/`reflect` with stall adaptation
     - Implement `Planner.plan(state) -> TickPlan` producing a per-Tick plan from state + goal, and `Planner.reflect(state, outcomes) -> LoopState` incorporating the observed reply-rate into the next plan
     - When target_metric improvement stays below the configured threshold across N consecutive Ticks (from `metric_history`), change at least one of thesis breadth, email angle, or send volume
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 2.3, 2.7, 6.7, 22_
 
-  - [ ] 13.5 Implement `ControlLoop.run_tick` orchestration and termination/persistence
+  - [x] 13.5 Implement `ControlLoop.run_tick` orchestration and termination/persistence
     - Implement `run_tick(state)` that calls `evaluate_termination` first each Tick, then runs Scanner→Qualifier→Writer→Sender→Optimizer in that order using the plan
     - Contain stage failure (stop remaining stages, record the failed stage, preserve prior state, proceed to next Tick), update loop state + reply-rate in ClickHouse after each Tick, run at most one Tick at a time, and on stop persist final state + stop reason with up to 3 retries (retaining them in memory on total failure)
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 2.1, 2.4, 2.5, 2.6, 2.8, 3.5, 3.7, 3.8, 11.1, 11.2, 22_
 
-- [ ] 14. Implement Langfuse observability
-  - [ ] 14.1 Implement the tracing wrapper with disabled fallback
+- [x] 14. Implement Langfuse observability
+  - [x] 14.1 Implement the tracing wrapper with disabled fallback
     - Implement a tracing wrapper (`angent/observability/tracing.py`) recording a trace per agent step (step id, input, output, start/end timestamps) within 2s and each TrueFoundry call as a linked span (prompt, response, token count)
     - If Langfuse is unconfigured at startup run untraced with a log entry; on trace/span write failure after 3 retries continue the step uninterrupted and log the failure
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 13.1, 13.2, 13.3, 13.4, 18.9, 22_
 
-- [ ] 15. Implement backend logging for front-end-optional operation
-  - [ ] 15.1 Implement the per-stage log/console emitter
+- [x] 15. Implement backend logging for front-end-optional operation
+  - [x] 15.1 Implement the per-stage log/console emitter
     - Implement a logging helper (`angent/observability/logging.py`) that emits a timestamped, stage-identified record for progress, qualifications, drafts, sends, and reply-rate trend within 2s of stage completion
     - On a failed record write continue remaining stages and emit an error record naming the failed stage; on any sponsor-integration failure preserve shared state and surface an error naming the technology
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 16.1, 16.2, 16.3, 16.4, 18.10, 22_
 
-- [ ] 16. Implement the Guild orchestrator wrapper (TypeScript)
-  - [ ] 16.1 Implement the Guild orchestrator and 5-second unavailability fallback
+- [x] 16. Implement the Guild orchestrator wrapper (TypeScript)
+  - [x] 16.1 Implement the Guild orchestrator and 5-second unavailability fallback
     - Implement the Guild orchestrator (TypeScript) that orchestrates the loop by calling the Python backend over HTTP and routes every send through the Governance_Gate
     - Classify Guild as unavailable when it does not respond within 5s so the Python core self-drives and enforces the gate
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 11.3, 11.4, 11.5, 11.6, 18.7, 22_
 
-  - [ ] 16.2 Implement the Python HTTP endpoint for Guild orchestration
+  - [x] 16.2 Implement the Python HTTP endpoint for Guild orchestration
     - Expose tick-advance and send-authorization HTTP endpoints (`angent/loop/server.py`) that the Guild orchestrator calls, backed by the same `GovernanceGate` so governance is identical whether self-driven or Guild-orchestrated
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 11.3, 11.4, 18.7, 22_
 
-- [ ] 17. Implement the UI surfaces
-  - [ ] 17.1 Implement the OpenUI_Surface thesis chat and deep-dive views
+- [x] 17. Implement the UI surfaces
+  - [x] 17.1 Implement the OpenUI_Surface thesis chat and deep-dive views
     - Generate the thesis-refinement chat and on-demand deep-dive at runtime via OpenUI Lang within a 5s budget each, reusing the `genui-chat-app` pipeline (`library.prompt()` → `/api/chat` → `<Renderer/>`)
     - On failure/timeout retain the last good rendered state and show an error; ensure every element comes from the generation step and each view includes at least one input/action element
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 14.1, 14.2, 14.3, 14.4, 14.5, 14.6, 18.8, 22_
 
-  - [ ] 17.2 Implement the React_Shell plain components
+  - [x] 17.2 Implement the React_Shell plain components
     - Build qualified-company cards, the drafted-email preview, and the loop-status display as plain React components with no OpenUI Lang markup
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 15.1, 22_
 
-  - [ ] 17.3 Implement the OpenUI / React_Shell separation and Impeccable guard
+  - [x] 17.3 Implement the OpenUI / React_Shell separation and Impeccable guard
     - Maintain unambiguous classification of each component as either OpenUI-generated or plain React, and ensure an Impeccable polish pass (`npx impeccable detect`) changes only plain React components, leaving OpenUI-generated components unchanged and continuing the pass when it encounters one
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 15.2, 15.3, 15.4, 15.5, 22_
 
-- [ ] 18. Wire components together and build the demo run
-  - [ ] 18.1 Wire all agents, gate, persistence, and tracing into a runnable entrypoint
+- [x] 18. Wire components together and build the demo run
+  - [x] 18.1 Wire all agents, gate, persistence, and tracing into a runnable entrypoint
     - Connect goal initiation → control loop → six agents → governance gate → sender → optimizer → ClickHouse + Langfuse + logging into a single runnable Python core entrypoint (`angent/main.py`) with no orphaned components
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 11.1, 12.1, 12.2, 12.3, 16.3, 22_
 
-  - [ ] 18.2 Implement the demo configuration and seed loader
+  - [x] 18.2 Implement the demo configuration and seed loader
     - Load seeded historical outcomes (`seeded=1`) into the `outcomes` table before the first Tick and configure the demo Goal (target in `[0,1]`, 120s deadline, 8-email budget, 3-10s Tick interval) in a demo config module/script
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 12.5, 19.1, 19.9, 22_
 
-- [ ] 20. Implement the Publisher (cited.md via Senso)
-  - [ ] 20.1 Implement the Deal_Memo markdown serializer
+- [x] 20. Implement the Publisher (cited.md via Senso)
+  - [x] 20.1 Implement the Deal_Memo markdown serializer
     - Implement `Publisher.serialize(companies)` (`angent/publisher.py`) reading the qualified companies from ClickHouse (name, URL, source, fit_score, fit_explanation, signals) and emitting a Deal_Memo in markdown with one section per company plus a provenance citation per company linking to its real source URL (GitHub repo or Hacker News post)
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 20.1, 20.2, 22_
 
-  - [ ] 20.2 Implement the Senso publish call with persistence and local fallback
+  - [x] 20.2 Implement the Senso publish call with persistence and local fallback
     - Implement `Publisher.publish(deal_memo)` calling `senso engine publish` with `SENSO_API_KEY`/`SENSO_BASE_URL` (X-API-Key header against `https://apiv2.senso.ai/api/v1`), persisting the returned cited.md URL/slug/handle to the `publications` table on success
     - Fall back to a non-blocking local file write when Senso is unreachable (record `published_ok=0` and `local_path`, surface the error, never abort the loop)
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 20.3, 20.4, 20.5, 18.11, 18.13, 22_
 
-  - [ ] 20.3 Keep the Deal_Memo separate from the OpenUI deep-dive
+  - [x] 20.3 Keep the Deal_Memo separate from the OpenUI deep-dive
     - Ensure the Deal_Memo is markdown (never OpenUI Lang) produced by a separate code path, while the OpenUI deep-dive renders the same ClickHouse data as the in-app human surface
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)
     - _Requirements: 20.6, 22_
 
 - [ ] 21. Implement the x402 Payment Gate
-  - [ ] 21.1 Implement the seller paywall over the deal-memo fetch endpoint
+  - [-] 21.1 Implement the seller paywall over the deal-memo fetch endpoint
     - Wrap the deal-memo fetch endpoint with `@x402/express` `paymentMiddleware` (composing `@x402/evm` `ExactEvmScheme` and `@x402/core` `HTTPFacilitatorClient`), reusing the `x402-test/server.mjs` pattern, configured from `X402_FACILITATOR_URL`/`X402_NETWORK`/`X402_PAY_TO_ADDRESS`/`X402_PRICE` with the "exact" USDC scheme
     - Return HTTP 402 without a valid payment; on a valid payment settle via the Facilitator and return the Deal_Memo content; record settled fetches to the `fetches` table; deny access without serving unpaid content when the Facilitator is unreachable
     - Commit this change to `main` with a descriptive message and push to https://github.com/Jiyungi/angent (Requirement 22)

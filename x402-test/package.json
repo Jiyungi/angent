@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "server": "node server.mjs",
+    "deal-memo": "node deal_memo_server.mjs",
     "buyer": "node buyer.mjs"
   },
   "dependencies": {

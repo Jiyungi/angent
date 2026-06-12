@@ -191,7 +191,11 @@ class TickOutcome:
     Fed to ``Planner.reflect`` to shape the next plan and persisted as part of
     the loop-state update after each Tick. ``failed_stage`` names the pipeline
     stage that failed (Scanner/Qualifier/Writer/Sender/Optimizer), if any
-    (Requirement 2.5).
+    (Requirement 2.5). ``stop_reason`` is set only on a **terminal** Tick — when
+    ``ControlLoop.run_tick`` evaluates termination first and finds a stop
+    condition, it returns an outcome carrying the single prioritized
+    :class:`StopReason` and runs **no** stages (Requirements 2.2, 3.x); the run
+    driver inspects it to stop the loop and persist the final state.
     """
 
     tick_index: int
@@ -202,3 +206,9 @@ class TickOutcome:
     replies: int = 0
     reply_rate: float = 0.0
     failed_stage: Optional[str] = None
+    stop_reason: Optional[StopReason] = None
+
+    @property
+    def terminal(self) -> bool:
+        """True when this Tick stopped the loop (a ``stop_reason`` was set)."""
+        return self.stop_reason is not None
